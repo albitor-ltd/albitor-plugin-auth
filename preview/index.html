@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Auth pack screens - flow wireframe</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!--
+      Neutral wireframe of the cognito-auth pack's four screens:
+      sign-up, login, confirm-code, resend.
+
+      This is a FLOW reference for scoping a build, NOT a style. The delivered
+      app's screens are styled by the app's chosen design-system skill (GDS,
+      shadcn, MUI, Carbon, ...). This page therefore deliberately uses a plain
+      system-font layout and carries no design-system branding. All CSS is
+      inlined so the file opens standalone from file:// with no external requests.
+    -->
+    <style>
+      :root {
+        --bg: #f4f5f6;
+        --card: #ffffff;
+        --ink: #10131a;
+        --muted: #5a6472;
+        --border: #c3c9d1;
+        --accent: #1d5b3f; /* neutral placeholder, not any real brand */
+        --focus: #ffcc33;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+        line-height: 1.5;
+      }
+      header {
+        background: var(--ink);
+        color: #fff;
+        padding: 14px 20px;
+        font-weight: 600;
+      }
+      header .tag {
+        font-weight: 400;
+        color: #b9c0c9;
+        font-size: 0.85rem;
+      }
+      main {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 24px 20px 48px;
+      }
+      .lede {
+        color: var(--muted);
+        max-width: 62ch;
+        margin: 0 0 28px;
+      }
+      .grid {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      }
+      .screen {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px;
+      }
+      .screen h2 {
+        margin: 0 0 4px;
+        font-size: 1.1rem;
+      }
+      .screen .flow {
+        color: var(--muted);
+        font-size: 0.8rem;
+        margin: 0 0 16px;
+      }
+      label {
+        display: block;
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin: 12px 0 4px;
+      }
+      input {
+        width: 100%;
+        padding: 8px 10px;
+        border: 2px solid var(--ink);
+        border-radius: 4px;
+        font-size: 1rem;
+        font-family: inherit;
+      }
+      input:focus { outline: 3px solid var(--focus); outline-offset: 0; }
+      .code {
+        letter-spacing: 0.4em;
+        text-align: center;
+        max-width: 10ch;
+      }
+      button {
+        margin-top: 18px;
+        width: 100%;
+        padding: 10px 14px;
+        border: 0;
+        border-radius: 4px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .link {
+        display: inline-block;
+        margin-top: 14px;
+        color: var(--accent);
+        font-size: 0.85rem;
+        text-decoration: underline;
+      }
+      .note {
+        margin-top: 14px;
+        padding: 10px 12px;
+        background: #eef2f0;
+        border-left: 4px solid var(--accent);
+        font-size: 0.8rem;
+        color: var(--muted);
+      }
+      footer {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 0 20px 40px;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+    </style>
+  </head>
+  <body>
+    <header>Auth pack <span class="tag">— screen flow wireframe (styling comes from the app's design system)</span></header>
+    <main>
+      <p class="lede">
+        The four screens the <code>cognito-auth</code> skill builds into a delivered app. Self-sign-up is
+        on by default; the done-criterion is that a first-time visitor can self-register from the app.
+        Sign-ups are auto-confirmed by default, so the confirm-code and resend screens are built but only
+        become live when real email verification is opted in.
+      </p>
+
+      <div class="grid">
+        <section class="screen" aria-label="Sign up">
+          <h2>Sign up</h2>
+          <p class="flow">Entry point · built first · calls Cognito SignUp</p>
+          <label for="su-email">Email address</label>
+          <input id="su-email" type="email" autocomplete="email">
+          <label for="su-pw">Password</label>
+          <input id="su-pw" type="password" autocomplete="new-password">
+          <label for="su-pw2">Confirm password</label>
+          <input id="su-pw2" type="password" autocomplete="new-password">
+          <button type="button">Create account</button>
+          <a class="link" href="#login">Already have an account? Sign in</a>
+          <p class="note">Auto-confirm default: account is usable immediately — no emailed code.</p>
+        </section>
+
+        <section class="screen" id="login" aria-label="Log in">
+          <h2>Log in</h2>
+          <p class="flow">USER_PASSWORD_AUTH · returns access + refresh tokens</p>
+          <label for="li-email">Email address</label>
+          <input id="li-email" type="email" autocomplete="email">
+          <label for="li-pw">Password</label>
+          <input id="li-pw" type="password" autocomplete="current-password">
+          <button type="button">Sign in</button>
+          <a class="link" href="#top">Need an account? Sign up</a>
+        </section>
+
+        <section class="screen" aria-label="Confirm code">
+          <h2>Confirm code</h2>
+          <p class="flow">Opt-in path · live only under real email verification</p>
+          <label for="cc-code">Verification code</label>
+          <input id="cc-code" class="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+          <button type="button">Confirm account</button>
+          <a class="link" href="#resend">Didn't get a code?</a>
+          <p class="note">Built even under auto-confirm, so enabling real verification is a config flip, not a rebuild.</p>
+        </section>
+
+        <section class="screen" id="resend" aria-label="Resend code">
+          <h2>Resend code</h2>
+          <p class="flow">ResendConfirmationCode · pairs with confirm-code</p>
+          <label for="rs-email">Email address</label>
+          <input id="rs-email" type="email" autocomplete="email">
+          <button type="button">Resend verification code</button>
+          <a class="link" href="#login">Back to sign in</a>
+        </section>
+      </div>
+    </main>
+    <footer>
+      Neutral wireframe — flow only. In a delivered app these screens are rendered with the app's chosen
+      design-system skill's components, never the Cognito Hosted UI.
+    </footer>
+  </body>
+</html>
