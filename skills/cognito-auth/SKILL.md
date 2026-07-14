@@ -1,7 +1,8 @@
 ---
 name: cognito-auth
 description: Use when building or reviewing end-user authentication for a delivered web app that should let people sign up and log in — the default auth mechanism. Covers an Amazon Cognito user pool with a public app client (USER_PASSWORD_AUTH), in-app sign-up / login / confirm-code / resend UI styled by the app's own design system (not the Cognito Hosted UI), JWT-validation API middleware, and a protected GET /api/me. Self-sign-up is supported and on by default; email verification auto-confirms unless real verification is opted in.
-capability: auth-mechanism
+metadata:
+  capability: auth-mechanism
 ---
 
 # Cognito auth (default auth pack)
