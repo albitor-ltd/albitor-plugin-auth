@@ -2,7 +2,7 @@ Distilled reference for the `cognito-auth` skill. Amazon Cognito changes; verify
 
 # Terraform: Cognito user pool + public app client
 
-The identity provider for the auth pack. Two required resources — a **user pool** (the directory of accounts) and a **public app client** (how the browser talks to it) — plus an optional auto-confirm Lambda that is the default sign-up experience.
+The identity provider for the auth pack. Two required resources — a **user pool** (the directory of accounts) and a **public app client** (how the browser talks to it) — plus a **dev-only** auto-confirm Lambda that is gated off outside development environments.
 
 ## What "public app client" means and why it matters
 
@@ -16,7 +16,7 @@ resource "aws_cognito_user_pool" "app" {
 
   # Sign in with an email address.
   username_attributes      = ["email"]
-  auto_verified_attributes = ["email"] # relevant only when real verification is on (see below)
+  auto_verified_attributes = ["email"] # DEFAULT: email must be verified by a confirmation code
 
   password_policy {
     minimum_length    = 8
@@ -33,10 +33,10 @@ resource "aws_cognito_user_pool" "app" {
     mutable             = true
   }
 
-  # DEFAULT: auto-confirm sign-ups (no emailed code). See "Auto-confirm" below.
-  lambda_config {
-    pre_sign_up = aws_lambda_function.auto_confirm.arn
-  }
+  # DEFAULT: real email verification — Cognito emails a confirmation code and the
+  # user confirms via the in-app confirm-code screen. No auto-confirm Lambda here.
+  # The dev/CI auto-confirm override wires a pre_sign_up Lambda into this block;
+  # see "Dev/CI override" below. Production/default leaves lambda_config unset.
 
   account_recovery_setting {
     recovery_mechanism {
@@ -77,30 +77,81 @@ resource "aws_cognito_user_pool_client" "spa" {
 }
 ```
 
-## Auto-confirm (the default sign-up experience)
+## Email verification (the default sign-up experience)
 
-By default, sign-ups are **auto-confirmed** with a tiny pre-sign-up Lambda so no verification email is sent and the user can log in immediately. This is the frictionless POC default and makes the security floor's checks deterministic.
+By default, sign-ups require a **verified email**. Cognito emails a confirmation
+code on sign-up; the user enters it on the in-app confirm-code screen (see
+`references/frontend.md`) before they can log in. This is **secure by default** —
+no unverified accounts, no auto-confirm Lambda. Nothing extra is needed beyond
+`auto_verified_attributes = ["email"]` on the pool (above) and leaving
+`lambda_config` unset. Configure the message via `verification_message_template`
+and, for production volumes, wire `email_configuration` to SES.
 
 ```hcl
+# In aws_cognito_user_pool.app — customise the emailed code message (optional):
+verification_message_template {
+  default_email_option = "CONFIRM_WITH_CODE"
+  email_subject        = "Your ${var.app_name} verification code"
+  email_message        = "Your verification code is {####}"
+}
+```
+
+## Dev/CI override: auto-confirm (development only)
+
+Albitor's own autonomous build/verify loop and design-system reviews must be able
+to self-prove the sign-up path **without a real inbox**. For that, and only in a
+**development or CI environment**, wire an auto-confirm pre-sign-up Lambda that
+confirms the user and marks the email verified with no emailed code. This is a
+**dev-only override** — it must never be enabled in production or in the default
+configuration, because it defeats email verification.
+
+Gate it on an explicit variable that defaults to *off* so the override cannot
+leak into a real deployment:
+
+```hcl
+variable "auth_dev_auto_confirm" {
+  description = "DEV/CI ONLY — auto-confirm sign-ups with no emailed code so the build can self-prove signup without a real inbox. MUST stay false in production/default."
+  type        = bool
+  default     = false # secure by default: real email verification
+}
+
+# Count-gated so the Lambda and its wiring only exist in dev/CI.
 resource "aws_lambda_function" "auto_confirm" {
-  function_name = "${var.app_name}-cognito-auto-confirm"
+  count         = var.auth_dev_auto_confirm ? 1 : 0
+  function_name = "${var.app_name}-cognito-auto-confirm-DEVONLY"
   runtime       = "nodejs20.x"
   handler       = "index.handler"
-  role          = aws_iam_role.auto_confirm.arn
+  role          = aws_iam_role.auto_confirm[0].arn
   filename      = data.archive_file.auto_confirm.output_path
 }
 
 resource "aws_lambda_permission" "cognito_invoke" {
+  count         = var.auth_dev_auto_confirm ? 1 : 0
   statement_id  = "AllowCognitoInvoke"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.auto_confirm.function_name
+  function_name = aws_lambda_function.auto_confirm[0].function_name
   principal     = "cognito-idp.amazonaws.com"
   source_arn    = aws_cognito_user_pool.app.arn
 }
 ```
 
+Attach the trigger to the pool **only** when the override is on. Keep the pool's
+base config verification-required; add the `pre_sign_up` trigger conditionally so
+the default deployment never carries it:
+
+```hcl
+# Add to aws_cognito_user_pool.app with a dynamic block so it appears only in dev/CI:
+dynamic "lambda_config" {
+  for_each = var.auth_dev_auto_confirm ? [1] : []
+  content {
+    pre_sign_up = aws_lambda_function.auto_confirm[0].arn
+  }
+}
+```
+
 ```js
-// index.js — pre-sign-up trigger: confirm every new user, skip email verification.
+// index.js — DEV/CI ONLY pre-sign-up trigger: confirm every new user, skip the emailed code.
+// Never deploy this outside a development environment.
 export const handler = async (event) => {
   event.response.autoConfirmUser = true;
   event.response.autoVerifyEmail = true; // marks email verified without a code
@@ -108,9 +159,9 @@ export const handler = async (event) => {
 };
 ```
 
-## Opt-in hardening: real email verification
-
-To require a genuine emailed code instead of auto-confirming, make a **one-attribute switch**: remove the `pre_sign_up` Lambda from `lambda_config` (or make it a no-op) and let Cognito's default flow send a verification code to `auto_verified_attributes = ["email"]`. The confirm-code and resend screens the app already ships (see `references/frontend.md`) then carry the real code entry — no UI rework. Configure the message via `verification_message_template` and, for production volumes, wire `email_configuration` to SES.
+Set `auth_dev_auto_confirm = true` only in the dev/CI tfvars so Albitor's
+build/verify loop can register and log in a throwaway user end-to-end; production
+and the default leave it `false` and exercise the real confirmation-code flow.
 
 ## Outputs the app needs
 

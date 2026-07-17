@@ -38,8 +38,8 @@ await cognito.send(new SignUpCommand({
 }));
 ```
 
-- **Under auto-confirm (default):** the user is immediately usable. Redirect straight to login (or auto-login) — do **not** force a code screen.
-- **Under real email verification (opt-in):** route to the confirm-code screen.
+- **Default (email verification required):** the new user is created but unconfirmed, and Cognito emails a confirmation code. Route straight to the **confirm-code screen** (§3) — this is the normal happy path.
+- **Dev/CI auto-confirm override only:** when the app's dev environment runs with the documented auto-confirm override (see `references/terraform.md`), the user is immediately usable — redirect to login (or auto-login) and skip the code screen. This is a development shortcut, not the default.
 - Surface Cognito errors (`UsernameExistsException`, `InvalidPasswordException`, `InvalidParameterException`) through the design system's error-summary pattern with human-readable messages.
 
 ## 2. Login screen
@@ -55,9 +55,9 @@ const out = await cognito.send(new InitiateAuthCommand({
 const { AccessToken, IdToken, RefreshToken } = out.AuthenticationResult!;
 ```
 
-Store the tokens (see below), then send the user to the app's authenticated area. Handle `NotAuthorizedException` (bad credentials) and `UserNotConfirmedException` (only reachable under real email verification → send to confirm-code).
+Store the tokens (see below), then send the user to the app's authenticated area. Handle `NotAuthorizedException` (bad credentials) and `UserNotConfirmedException` — under the verification-required default this is a normal case (the user signed up but hasn't entered their code yet), so route them to the confirm-code screen (§3).
 
-## 3. Confirm-code screen (built even under auto-confirm)
+## 3. Confirm-code screen (default happy path)
 
 Form: the 6-digit code. Call `ConfirmSignUpCommand`.
 
@@ -69,7 +69,7 @@ await cognito.send(new ConfirmSignUpCommand({
 }));
 ```
 
-Under the auto-confirm default this screen is unreachable in the normal flow — but ship it, because enabling real email verification is a config flip (see `references/terraform.md`) that makes it live with no rework.
+This screen is on the **default happy path**: after sign-up the user lands here, enters the emailed code, and is confirmed before they can log in. It is only skipped when the dev/CI auto-confirm override is active (see `references/terraform.md`), so build it as a first-class screen, not an afterthought.
 
 ## 4. Resend-code screen / action
 
@@ -84,10 +84,16 @@ await cognito.send(new ResendConfirmationCodeCommand({
 
 ## Storing and using tokens
 
+**The session must survive a page reload, and deep-links must work.** A user who
+refreshes the tab or opens a bookmarked protected URL stays signed in — this is a
+non-negotiable baseline, not a preference. Losing the session on reload is a bug.
+
 - Keep the **access token** for API calls and send it as `Authorization: Bearer <accessToken>` (the API middleware verifies it — see `references/api.md`).
-- Prefer in-memory storage with a refresh-on-load using the refresh token; if you must persist, weigh the XSS trade-offs of `localStorage`. Do not put tokens in non-`HttpOnly` cookies naively.
-- Refresh with `InitiateAuthCommand` + `AuthFlow: "REFRESH_TOKEN_AUTH"` before expiry (access/id tokens last 60 min by default).
-- On logout, discard the stored tokens client-side.
+- **Baseline (required): persist the refresh token in `localStorage` and rehydrate on load.** The access/id tokens may live in memory, but the **refresh token** is written to `localStorage` so that on app start you can silently re-mint fresh access/id tokens via `REFRESH_TOKEN_AUTH` (below) before rendering the authenticated area. This is what makes reload and deep-links work, and it matches Amplify Auth's default persistence — so if the app uses Amplify, its default already satisfies this baseline.
+- **On load:** read the stored refresh token; if present, run a `REFRESH_TOKEN_AUTH` call to rehydrate the in-memory access/id tokens, then treat the user as signed in. If it fails (expired/revoked), clear the stored token and route to login.
+- **Hardening for higher-security deployments (recommended): HttpOnly refresh-cookie + backend token endpoint (BFF).** Keep the refresh token out of JavaScript entirely by having a small backend set it as an `HttpOnly`, `Secure`, `SameSite` cookie and exposing a token endpoint the SPA calls to mint access tokens. The XSS tradeoff is plain: a refresh token in `localStorage` is readable by any injected script, whereas an `HttpOnly` cookie is not — so security-sensitive deployments should prefer the BFF pattern. But **survive-reload is the baseline either way**; the BFF is how you harden it, not an excuse to drop persistence back to memory-only.
+- Refresh with `InitiateAuthCommand` + `AuthFlow: "REFRESH_TOKEN_AUTH"` before expiry (access/id tokens last 60 min by default), and on app load as described above.
+- On logout, discard the in-memory tokens **and** remove the persisted refresh token (or clear the BFF cookie).
 
 ## Styling: consume the design-system skill
 

@@ -4,9 +4,12 @@ Reference for the `cognito-auth` skill: the done-criterion and the skill-declare
 
 ## Done-criterion
 
-> **A first-time visitor can self-register from the app.**
+> **A first-time visitor can self-register from the app — sign up, confirm their email, and sign in.**
 
-This is the single outcome the auth pack exists to guarantee. Build the sign-up path first and treat it as the definition of done.
+This is the single outcome the auth pack exists to guarantee. Email verification
+is **required by default** (secure by default), so self-registration includes the
+confirmation-code step. Build the sign-up path first and treat it as the
+definition of done.
 
 ## Two layers of check
 
@@ -23,8 +26,16 @@ This is the single outcome the auth pack exists to guarantee. Build the sign-up 
    - *Renders:* the app serves a sign-up route/page that returns its form.
    - **Residual gap (accepted for v1):** a rendered-but-dead-end sign-up form
      would pass this presence-level proof. The upgrade path is to promote it to
-     the Playwright verification tier (full browser sign-up → login → protected
-     route), not to add heavier assertions here.
+     the Playwright verification tier (full browser sign-up → confirm → login →
+     protected route), not to add heavier assertions here.
+
+**Self-provability under required verification.** Email verification is required
+by default, so a real emailed code would normally be needed to confirm a new
+user. Albitor's autonomous build/verify loop has no inbox, so the build's **dev
+environment** uses the documented **dev/CI auto-confirm override** (see
+`references/terraform.md`) to confirm the throwaway test user with no emailed
+code. Production and the default stay verification-required; only the dev
+environment carries the override.
 
 ## Machine-readable declaration
 
@@ -39,17 +50,19 @@ albitor-skill-verification:
   capability: auth-mechanism
   skill: cognito-auth
   supports_self_signup: true
-  self_signup_default: enabled
-  done_criterion: "A first-time visitor can self-register from the app."
+  self_signup_default: enabled              # self-service sign-up is on by default
+  email_verification_default: required      # DEFAULT: confirmation code required (secure by default; was auto-confirm)
+  dev_self_prove_override: auto-confirm-dev-only # dev/CI-only auto-confirm so the build proves signup without a real inbox (see terraform.md)
+  done_criterion: "A first-time visitor can self-register from the app — sign up, confirm their email, and sign in."
   checks:
     - id: self-signup-wired-and-renders
       description: "Sign-up API path is wired and a sign-up route renders."
       proof:
         - api-path-wired      # app calls Cognito SignUp; self-service sign-up enabled on the pool
         - signup-route-renders # app serves a sign-up page that returns its form
-      tier: presence          # v1: NOT a full browser e2e
+      tier: presence          # v1: NOT a full browser e2e (presence-level proof kept as-is)
       blocking: false         # advisory skill check; the universal api-auth floor remains the blocking gate
-      upgrade_path: playwright-signup-to-login-to-protected-route
+      upgrade_path: playwright-signup-to-confirm-to-login-to-protected-route
   relies_on_floor:
     - id: api-auth
       description: "Declared non-public endpoints return 401 unauthenticated (Albitor-owned, blocking)."

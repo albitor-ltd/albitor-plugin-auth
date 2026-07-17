@@ -1,6 +1,6 @@
 ---
 name: cognito-auth
-description: Use when building or reviewing end-user authentication for a delivered web app that should let people sign up and log in — the default auth mechanism. Covers an Amazon Cognito user pool with a public app client (USER_PASSWORD_AUTH), in-app sign-up / login / confirm-code / resend UI styled by the app's own design system (not the Cognito Hosted UI), JWT-validation API middleware, and a protected GET /api/me. Self-sign-up is supported and on by default; email verification auto-confirms unless real verification is opted in.
+description: Use when building or reviewing end-user authentication for a delivered web app that should let people sign up and log in — the default auth mechanism. Covers an Amazon Cognito user pool with a public app client (USER_PASSWORD_AUTH), in-app sign-up / login / confirm-code / resend UI styled by the app's own design system (not the Cognito Hosted UI), JWT-validation API middleware, and a protected GET /api/me. Self-sign-up is supported and on by default; email verification is required by default (secure by default), with a dev/CI-only auto-confirm override so the build can self-prove signup without a real inbox.
 metadata:
   capability: auth-mechanism
 ---
@@ -13,13 +13,13 @@ It exists because the alternative — improvising auth above a bare basic-auth f
 
 ## Done-criterion (the thing that must be true)
 
-> **A first-time visitor can self-register from the app.**
+> **A first-time visitor can self-register from the app — sign up, confirm their email, and sign in.**
 
-If a new user cannot create an account from the running app's own UI and then sign in, the auth pack is not done — no matter how much of the wiring is in place. Build the sign-up path first, not last.
+If a new user cannot create an account from the running app's own UI, confirm their email, and then sign in, the auth pack is not done — no matter how much of the wiring is in place. Build the sign-up path first, not last.
 
 ## Self-sign-up support (declared)
 
-This skill **supports self-sign-up, and it is enabled by default.** Anyone who reaches the app can create their own account through the in-app sign-up form; there is no admin-invite step in the default configuration. Self-sign-up handling and its parameters (auto-confirm vs. emailed verification, allowed email domains) belong to *this* skill — there is no global app-wide sign-up switch to keep in sync across auth mechanisms. If the app needs invite-only access, that is an explicit hardening on top of this skill (see `references/api.md`), not the default.
+This skill **supports self-sign-up, and it is enabled by default.** Anyone who reaches the app can create their own account through the in-app sign-up form; there is no admin-invite step in the default configuration. Self-sign-up handling and its parameters (required email verification vs. the dev/CI auto-confirm override, allowed email domains) belong to *this* skill — there is no global app-wide sign-up switch to keep in sync across auth mechanisms. If the app needs invite-only access, that is an explicit hardening on top of this skill (see `references/api.md`), not the default.
 
 ## What this skill delivers
 
@@ -30,11 +30,11 @@ Four moving parts, each detailed in a bundled reference:
 3. **API — the gate.** JWT-validation middleware that verifies Cognito-issued access tokens against the pool's JWKS, plus a protected `GET /api/me` that echoes the caller's identity. See `references/api.md`.
 4. **Verification — the proof.** The done-criterion above, plus the machine-readable skill-declared check the delivery factory reads. See `references/verification.md` and the [Verification](#verification-skill-declared) section below.
 
-## Email verification: auto-confirm by default
+## Email verification: required by default
 
-Sign-ups are **auto-confirmed by default** — no emailed verification code, no round-trip. A user who submits the sign-up form is immediately able to log in. This keeps proof-of-concept users frictionless and the security floor's checks trivially deterministic.
+Sign-ups **require a verified email by default** — secure by default. Cognito emails a confirmation code; the user enters it on the in-app confirm-code screen before they can log in. The confirm-code and resend screens are therefore on the **default happy path**, not an opt-in extra.
 
-The confirm-code and resend screens are still built, because **real email verification is an opt-in hardening**: flip the user pool to require a verified email (and stop auto-confirming), and those screens carry the real code-entry flow with zero UI rework. Build both screens even when auto-confirm is on. `references/terraform.md` shows the one-attribute switch between the two modes.
+Albitor's own autonomous build/verify loop has no inbox, so a **dev/CI-only auto-confirm override** (a var-gated pre-sign-up Lambda, off by default) lets the build register and log in a throwaway user with no emailed code — while production and the default stay verification-required. The override must never be enabled outside a development environment. `references/terraform.md` shows the verification-required default and the clearly dev-only override.
 
 ## Styling comes from the design system, never the Hosted UI
 
@@ -44,7 +44,7 @@ Do **not** enable or link to the **Cognito Hosted UI**. The sign-up and login sc
 
 | File | When to read it |
 | --- | --- |
-| `references/terraform.md` | Provisioning the user pool + public app client, the `USER_PASSWORD_AUTH` flow, auto-confirm vs. real email verification, and the outputs the app needs. |
+| `references/terraform.md` | Provisioning the user pool + public app client, the `USER_PASSWORD_AUTH` flow, the verification-required default vs. the dev/CI auto-confirm override, and the outputs the app needs. |
 | `references/frontend.md` | Building the sign-up / login / confirm-code / resend screens, calling Cognito from the browser, storing and refreshing tokens, and wiring the styling to the chosen design system. |
 | `references/api.md` | The JWT-validation middleware (JWKS verification, issuer/audience/expiry checks), the protected `GET /api/me`, and how the universal `api-auth` security floor sees this. |
 | `references/verification.md` | The done-criterion and the machine-readable skill-declared verification entry (the v1 self-sign-up proof). |
@@ -62,7 +62,7 @@ The machine-readable form of this declaration — the intent a scanner ingests �
 - **Public app client, no secret.** A browser SPA cannot keep a client secret; generating one breaks `USER_PASSWORD_AUTH` from the browser. Never add a secret to the app client.
 - **Never ship credentials in code.** The user pool id and app client id are public config (safe in the browser); they reach the app as build-time config, not hardcoded secrets. There is no secret to embed.
 - **Build sign-up first.** The done-criterion is self-registration. Start there, then login, then the protected route — not the other way round.
-- **Both verification screens, always.** Build confirm-code and resend even under auto-confirm, so turning on real email verification is a config flip, not a rebuild.
+- **Both verification screens, always.** Confirm-code and resend are on the default happy path (verification required); build them as first-class screens. The dev/CI auto-confirm override is the only thing that skips them, and only in development.
 - **Validate tokens server-side.** Never trust a token the browser hands you without verifying its signature against the pool JWKS and checking issuer, use/audience, and expiry. See `references/api.md`.
 - **Let the design system style it.** Consume the app's design-system skill for every form control and error pattern; this skill does not carry its own visual style.
 
