@@ -105,6 +105,13 @@ confirms the user and marks the email verified with no emailed code. This is a
 **dev-only override** — it must never be enabled in production or in the default
 configuration, because it defeats email verification.
 
+The trigger is a **Go Lambda on the `provided.al2023` runtime** — the same OS-only
+runtime and prebuilt-`bootstrap` packaging the app's API Lambda already uses, so
+there is no managed-language runtime to age out. (This override previously ran on
+`nodejs20.x`; it was moved to `provided.al2023` to stop the recurring managed-runtime
+EOL churn.) CI already sets up Go and builds the API `bootstrap`; build this one the
+same way — see "Building the bootstrap" below.
+
 Gate it on an explicit variable that defaults to *off* so the override cannot
 leak into a real deployment:
 
@@ -115,14 +122,26 @@ variable "auth_dev_auto_confirm" {
   default     = false # secure by default: real email verification
 }
 
-# Count-gated so the Lambda and its wiring only exist in dev/CI.
+# Count-gated so the Lambda, its zip, and its wiring only exist in dev/CI.
+# archive_file zips the prebuilt bootstrap binary (built in CI — see "Building the
+# bootstrap" below); count-gating it too means a disabled build never needs the
+# binary present, so terraform validate/plan stay green with the override off.
+data "archive_file" "auto_confirm" {
+  count       = var.auth_dev_auto_confirm ? 1 : 0
+  type        = "zip"
+  source_file = "${path.module}/lambda-src/auto-confirm/bootstrap"
+  output_path = "${path.module}/build/auto-confirm.zip"
+}
+
 resource "aws_lambda_function" "auto_confirm" {
-  count         = var.auth_dev_auto_confirm ? 1 : 0
-  function_name = "${var.app_name}-cognito-auto-confirm-DEVONLY"
-  runtime       = "nodejs20.x"
-  handler       = "index.handler"
-  role          = aws_iam_role.auto_confirm[0].arn
-  filename      = data.archive_file.auto_confirm.output_path
+  count            = var.auth_dev_auto_confirm ? 1 : 0
+  function_name    = "${var.app_name}-cognito-auto-confirm-DEVONLY"
+  runtime          = "provided.al2023" # OS-only runtime — no managed-language EOL
+  handler          = "bootstrap"
+  architectures    = ["x86_64"]        # match the API Lambda's go build target
+  role             = aws_iam_role.auto_confirm[0].arn
+  filename         = data.archive_file.auto_confirm[0].output_path
+  source_code_hash = data.archive_file.auto_confirm[0].output_base64sha256
 }
 
 resource "aws_lambda_permission" "cognito_invoke" {
@@ -149,15 +168,55 @@ dynamic "lambda_config" {
 }
 ```
 
-```js
-// index.js — DEV/CI ONLY pre-sign-up trigger: confirm every new user, skip the emailed code.
-// Never deploy this outside a development environment.
-export const handler = async (event) => {
-  event.response.autoConfirmUser = true;
-  event.response.autoVerifyEmail = true; // marks email verified without a code
-  return event;
-};
+```go
+// lambda-src/auto-confirm/main.go — DEV/CI ONLY pre-sign-up trigger: confirm
+// every new user, skip the emailed code. Never deploy this outside development.
+package main
+
+import (
+	"context"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+)
+
+func handler(_ context.Context, event events.CognitoEventUserPoolsPreSignup) (events.CognitoEventUserPoolsPreSignup, error) {
+	event.Response.AutoConfirmUser = true
+	event.Response.AutoVerifyEmail = true // marks email verified without a code
+	return event, nil
+}
+
+func main() {
+	lambda.Start(handler)
+}
 ```
+
+```
+// lambda-src/auto-confirm/go.mod
+module autoconfirm
+
+go 1.25
+
+require github.com/aws/aws-lambda-go v1.49.0
+```
+
+### Building the bootstrap
+
+The `bootstrap` binary is built in CI **before** `terraform plan`/`apply`, exactly
+like the API Lambda — Terraform only zips the prebuilt artifact, it never compiles.
+With the app's existing `actions/setup-go` step in place, add a build for this
+module (only needed when the override is on):
+
+```bash
+cd infrastructure/aws/lambda-src/auto-confirm
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags lambda.norpc -o bootstrap .
+```
+
+Git-ignore the built binary (`infrastructure/aws/lambda-src/auto-confirm/bootstrap`)
+and `infrastructure/aws/build/` — they are CI artifacts, like `api/bootstrap`.
+Unit-test the handler with `go test ./...` (this replaces the old Node `node --test`
+step). `terraform validate` stays green without a build because the count-gated
+`archive_file` isn't read when `auth_dev_auto_confirm` is false.
 
 Set `auth_dev_auto_confirm = true` only in the dev/CI tfvars so Albitor's
 build/verify loop can register and log in a throwaway user end-to-end; production
