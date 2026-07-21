@@ -19,15 +19,23 @@ definition of done.
    *broken* auth outcome whatever the cause. See `references/api.md`.
 
 2. **Skill-declared check (this skill).**
-   The self-sign-up proof for **v1** is: **the sign-up API path is wired *and* a
-   sign-up route renders** — deliberately *not* a full browser end-to-end test.
+   The self-sign-up proof for **v1** is: **the sign-up API path is wired, a
+   sign-up route renders, *and* that route is reachable from the login page** —
+   deliberately *not* a full browser end-to-end test.
    - *Wired:* the app calls Cognito `SignUp` (self-service sign-up is enabled on
      the pool) and a new user can subsequently authenticate.
    - *Renders:* the app serves a sign-up route/page that returns its form.
-   - **Residual gap (accepted for v1):** a rendered-but-dead-end sign-up form
-     would pass this presence-level proof. The upgrade path is to promote it to
-     the Playwright verification tier (full browser sign-up → confirm → login →
-     protected route), not to add heavier assertions here.
+   - *Reachable:* the login page carries a link to the sign-up route (the
+     "Don't have an account? Sign up" cross-link), and that link resolves to the
+     sign-up route — a first-time visitor on the login page can get to sign-up
+     from the UI, not just by typing the URL.
+   - **Gap closed vs. earlier v1:** a rendered-but-dead-end sign-up form (present
+     at a URL but not linked from login) previously passed; the reachability
+     clause now fails it. **Residual gap (accepted for v1):** the check confirms
+     the login→sign-up link resolves, not that the full sign-up → confirm →
+     login → protected-route journey succeeds. The upgrade path is to promote it
+     to the Playwright verification tier for that full journey, not to add
+     heavier assertions here.
 
 **Self-provability under required verification.** Email verification is required
 by default, so a real emailed code would normally be needed to confirm a new
@@ -55,13 +63,14 @@ albitor-skill-verification:
   dev_self_prove_override: auto-confirm-dev-only # dev/CI-only auto-confirm so the build proves signup without a real inbox (see terraform.md)
   done_criterion: "A first-time visitor can self-register from the app — sign up, confirm their email, and sign in."
   checks:
-    - id: self-signup-wired-and-renders
-      description: "Sign-up API path is wired and a sign-up route renders."
+    - id: self-signup-wired-renders-and-reachable
+      description: "Sign-up API path is wired, a sign-up route renders, and it is reachable from the login page."
       proof:
-        - api-path-wired      # app calls Cognito SignUp; self-service sign-up enabled on the pool
-        - signup-route-renders # app serves a sign-up page that returns its form
-      tier: presence          # v1: NOT a full browser e2e (presence-level proof kept as-is)
-      blocking: false         # advisory skill check; the universal api-auth floor remains the blocking gate
+        - api-path-wired          # app calls Cognito SignUp; self-service sign-up enabled on the pool
+        - signup-route-renders    # app serves a sign-up page that returns its form
+        - reachable-from-login    # the login page links to the sign-up route and the link resolves (closes the dead-end-form gap)
+      tier: presence              # v1: NOT a full browser e2e (presence + reachability, not the full journey)
+      blocking: false             # advisory skill check; the universal api-auth floor remains the blocking gate
       upgrade_path: playwright-signup-to-confirm-to-login-to-protected-route
   relies_on_floor:
     - id: api-auth

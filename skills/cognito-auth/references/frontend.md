@@ -41,6 +41,7 @@ await cognito.send(new SignUpCommand({
 - **Default (email verification required):** the new user is created but unconfirmed, and Cognito emails a confirmation code. Route straight to the **confirm-code screen** (§3) — this is the normal happy path.
 - **Dev/CI auto-confirm override only:** when the app's dev environment runs with the documented auto-confirm override (see `references/terraform.md`), the user is immediately usable — redirect to login (or auto-login) and skip the code screen. This is a development shortcut, not the default.
 - Surface Cognito errors (`UsernameExistsException`, `InvalidPasswordException`, `InvalidParameterException`) through the design system's error-summary pattern with human-readable messages.
+- **Cross-link to login (required).** The sign-up screen MUST carry an "Already have an account? Log in" link that navigates to the login route. Build it from the design system's link/anchor component (see "Styling" below) — do not hand-roll it. This is the return half of the login⇄sign-up pair; the two screens must be reachable from each other in the UI, never only by typing a URL.
 
 ## 2. Login screen
 
@@ -56,6 +57,8 @@ const { AccessToken, IdToken, RefreshToken } = out.AuthenticationResult!;
 ```
 
 Store the tokens (see below), then send the user to the app's authenticated area. Handle `NotAuthorizedException` (bad credentials) and `UserNotConfirmedException` — under the verification-required default this is a normal case (the user signed up but hasn't entered their code yet), so route them to the confirm-code screen (§3).
+
+- **Cross-link to sign-up (required).** The login screen MUST carry a "Don't have an account? Sign up" link that navigates to the sign-up route. A first-time visitor who lands on `/login` has to be able to REACH sign-up from the UI itself — not by guessing or typing the `/signup` URL. Build the link from the design system's link/anchor component (see "Styling" below); do not hand-roll it. This is not a Hosted-UI link — it targets the app's own in-app sign-up route (§1), which is the exact opposite of linking out to the Cognito Hosted UI.
 
 ## 3. Confirm-code screen (default happy path)
 
@@ -97,4 +100,4 @@ non-negotiable baseline, not a preference. Losing the session on reload is a bug
 
 ## Styling: consume the design-system skill
 
-Every field, button, inline error, and error summary on these four screens comes from the app's selected design-system skill. Do not hand-roll form CSS and do not fall back to the Cognito Hosted UI. If no design-system skill is loaded when you build these screens, stop and ask which design system applies.
+Every field, button, link, inline error, and error summary on these four screens comes from the app's selected design-system skill — including the login⇄sign-up cross-links (§1, §2), which use the design system's link/anchor component. Do not hand-roll form CSS and do not fall back to the Cognito Hosted UI. If no design-system skill is loaded when you build these screens, stop and ask which design system applies.

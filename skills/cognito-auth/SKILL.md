@@ -17,6 +17,8 @@ It exists because the alternative — improvising auth above a bare basic-auth f
 
 If a new user cannot create an account from the running app's own UI, confirm their email, and then sign in, the auth pack is not done — no matter how much of the wiring is in place. Build the sign-up path first, not last.
 
+Self-registration must be **reachable**, not merely present: a first-time visitor who lands on the login page must be able to get to sign-up from the UI itself. The login and sign-up screens **must cross-link** — a "Don't have an account? Sign up" link on login and an "Already have an account? Log in" link on sign-up (see `references/frontend.md`). A sign-up form that only exists at a URL nobody can navigate to does not satisfy the done-criterion.
+
 ## Self-sign-up support (declared)
 
 This skill **supports self-sign-up, and it is enabled by default.** Anyone who reaches the app can create their own account through the in-app sign-up form; there is no admin-invite step in the default configuration. Self-sign-up handling and its parameters (required email verification vs. the dev/CI auto-confirm override, allowed email domains) belong to *this* skill — there is no global app-wide sign-up switch to keep in sync across auth mechanisms. If the app needs invite-only access, that is an explicit hardening on top of this skill (see `references/api.md`), not the default.
@@ -53,7 +55,7 @@ Do **not** enable or link to the **Cognito Hosted UI**. The sign-up and login sc
 
 The universal `api-auth` security floor still applies and is unchanged: declared non-public endpoints must return `401` when called unauthenticated. That is Albitor-owned and blocking whatever auth mechanism is chosen — it catches a *broken* auth outcome.
 
-On top of the floor, this skill declares its own check. **For v1 the self-sign-up proof is: the sign-up API path is wired *and* a sign-up route renders — not a full browser end-to-end test.** (Residual gap accepted for v1: a rendered-but-dead-end sign-up form would pass this proof; the upgrade path is to promote it to the Playwright verification tier.)
+On top of the floor, this skill declares its own check. **For v1 the self-sign-up proof is: the sign-up API path is wired, a sign-up route renders, *and* that route is reachable from the login page — a login→sign-up link exists and resolves to the sign-up route — not a full browser end-to-end test.** The reachability clause closes the earlier dead-end gap: a sign-up form that renders only at an un-navigable URL no longer passes. (Residual gap accepted for v1: the check confirms the link resolves, not that a full sign-up→confirm→login journey succeeds; the upgrade path is to promote it to the Playwright verification tier.)
 
 The machine-readable form of this declaration — the intent a scanner ingests — lives in `references/verification.md` under the `albitor-skill-verification` block. Keep the done-criterion and the check in lockstep with that block.
 
@@ -62,6 +64,7 @@ The machine-readable form of this declaration — the intent a scanner ingests �
 - **Public app client, no secret.** A browser SPA cannot keep a client secret; generating one breaks `USER_PASSWORD_AUTH` from the browser. Never add a secret to the app client.
 - **Never ship credentials in code.** The user pool id and app client id are public config (safe in the browser); they reach the app as build-time config, not hardcoded secrets. There is no secret to embed.
 - **Build sign-up first.** The done-criterion is self-registration. Start there, then login, then the protected route — not the other way round.
+- **Cross-link login and sign-up.** Self-registration must be reachable from the UI, not just present at a URL: the login screen carries a "Don't have an account? Sign up" link and the sign-up screen an "Already have an account? Log in" link, both built from the design system's link/anchor component. These are in-app route links — they do **not** contradict the Hosted-UI prohibition above, which forbids linking *out* to the Cognito Hosted UI.
 - **Both verification screens, always.** Confirm-code and resend are on the default happy path (verification required); build them as first-class screens. The dev/CI auto-confirm override is the only thing that skips them, and only in development.
 - **Validate tokens server-side.** Never trust a token the browser hands you without verifying its signature against the pool JWKS and checking issuer, use/audience, and expiry. See `references/api.md`.
 - **Let the design system style it.** Consume the app's design-system skill for every form control and error pattern; this skill does not carry its own visual style.

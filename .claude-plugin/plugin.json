@@ -1,7 +1,7 @@
 {
   "name": "auth",
   "displayName": "Auth pack (Cognito)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "The default auth pack: end-user sign-up and login for a delivered app, backed by an Amazon Cognito user pool with a public app client, in-app UI (styled by the app's chosen design system, not the Cognito Hosted UI), and JWT-validated API middleware. Self-sign-up is on by default.",
   "author": {
     "name": "Albitor Ltd",
