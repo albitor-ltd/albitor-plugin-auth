@@ -134,10 +134,10 @@
     <main>
       <p class="lede">
         The four screens the <code>cognito-auth</code> skill builds into a delivered app. Self-sign-up is
-        on by default; the done-criterion is that a first-time visitor can self-register from the app,
-        confirm their email, and sign in. Email verification is required by default (secure by default),
-        so the confirm-code and resend screens are on the happy path — a dev/CI-only auto-confirm override
-        lets the build self-prove signup without a real inbox.
+        on by default; the done-criterion is that a first-time visitor can reach sign-up from the login
+        page, create an account, and — once it is confirmed — sign in and reach a protected route. Email
+        verification is required in every environment (secure by default), so the confirm-code and resend
+        screens are on the happy path and the delivered app carries no auto-confirm bypass.
       </p>
 
       <div class="grid">
@@ -152,7 +152,7 @@
           <input id="su-pw2" type="password" autocomplete="new-password">
           <button type="button">Create account</button>
           <a class="link" href="#login">Already have an account? Sign in</a>
-          <p class="note">Verify-required default: sign-up emails a code and routes to confirm. Dev/CI override auto-confirms.</p>
+          <p class="note">Verification required everywhere: sign-up emails a code and routes to confirm. No bypass.</p>
         </section>
 
         <section class="screen" id="login" aria-label="Log in">
@@ -173,7 +173,7 @@
           <input id="cc-code" class="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
           <button type="button">Confirm account</button>
           <a class="link" href="#resend">Didn't get a code?</a>
-          <p class="note">On the default happy path; only the dev/CI auto-confirm override skips it.</p>
+          <p class="note">On the happy path in every environment; nothing in the delivered app skips it.</p>
         </section>
 
         <section class="screen" id="resend" aria-label="Resend code">

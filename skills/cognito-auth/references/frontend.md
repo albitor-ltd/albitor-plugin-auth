@@ -38,8 +38,7 @@ await cognito.send(new SignUpCommand({
 }));
 ```
 
-- **Default (email verification required):** the new user is created but unconfirmed, and Cognito emails a confirmation code. Route straight to the **confirm-code screen** (§3) — this is the normal happy path.
-- **Dev/CI auto-confirm override only:** when the app's dev environment runs with the documented auto-confirm override (see `references/terraform.md`), the user is immediately usable — redirect to login (or auto-login) and skip the code screen. This is a development shortcut, not the default.
+- **Always (email verification required):** the new user is created but unconfirmed, and Cognito emails a confirmation code. Route straight to the **confirm-code screen** (§3). There is no environment in which this differs — the app carries no auto-confirm bypass (see `references/terraform.md`), so do not branch the UI on one.
 - Surface Cognito errors (`UsernameExistsException`, `InvalidPasswordException`, `InvalidParameterException`) through the design system's error-summary pattern with human-readable messages.
 - **Cross-link to login (required).** The sign-up screen MUST carry an "Already have an account? Log in" link that navigates to the login route. Build it from the design system's link/anchor component (see "Styling" below) — do not hand-roll it. This is the return half of the login⇄sign-up pair; the two screens must be reachable from each other in the UI, never only by typing a URL.
 
@@ -72,7 +71,7 @@ await cognito.send(new ConfirmSignUpCommand({
 }));
 ```
 
-This screen is on the **default happy path**: after sign-up the user lands here, enters the emailed code, and is confirmed before they can log in. It is only skipped when the dev/CI auto-confirm override is active (see `references/terraform.md`), so build it as a first-class screen, not an afterthought.
+This screen is on the **happy path in every environment**: after sign-up the user lands here, enters the emailed code, and is confirmed before they can log in. Nothing in the delivered app skips it, so build it as a first-class screen, not an afterthought. (Albitor's deployed e2e confirms its own throwaway user out-of-band from CI rather than reading an inbox — that happens outside the app and changes nothing about this screen; see `references/verification.md`.)
 
 ## 4. Resend-code screen / action
 

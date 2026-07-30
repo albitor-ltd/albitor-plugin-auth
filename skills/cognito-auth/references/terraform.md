@@ -2,7 +2,9 @@ Distilled reference for the `cognito-auth` skill. Amazon Cognito changes; verify
 
 # Terraform: Cognito user pool + public app client
 
-The identity provider for the auth pack. Two required resources — a **user pool** (the directory of accounts) and a **public app client** (how the browser talks to it) — plus a **dev-only** auto-confirm Lambda that is gated off outside development environments.
+The identity provider for the auth pack. Two resources, and only two — a **user pool** (the directory of accounts) and a **public app client** (how the browser talks to it).
+
+**There is no dev/CI variant of this Terraform.** The pool you ship is the pool you would ship in production: email verification required, no `lambda_config`, no `pre_sign_up` trigger, no variable that can turn any of that off. Albitor's build/verify loop still proves the sign-up journey end to end — it does it by confirming its own throwaway user through the Cognito **admin API from the deploy job**, which needs nothing in the app's infrastructure. See `references/verification.md`.
 
 ## What "public app client" means and why it matters
 
@@ -33,10 +35,11 @@ resource "aws_cognito_user_pool" "app" {
     mutable             = true
   }
 
-  # DEFAULT: real email verification — Cognito emails a confirmation code and the
-  # user confirms via the in-app confirm-code screen. No auto-confirm Lambda here.
-  # The dev/CI auto-confirm override wires a pre_sign_up Lambda into this block;
-  # see "Dev/CI override" below. Production/default leaves lambda_config unset.
+  # Real email verification, in EVERY environment — Cognito emails a confirmation
+  # code and the user confirms via the in-app confirm-code screen. Deliberately no
+  # lambda_config and no pre_sign_up trigger: a pre-sign-up trigger that
+  # auto-confirms would defeat email verification for every visitor, not just the
+  # test harness. CI confirms its own test user out-of-band — see verification.md.
 
   account_recovery_setting {
     recovery_mechanism {
@@ -79,10 +82,11 @@ resource "aws_cognito_user_pool_client" "spa" {
 
 ## Email verification (the default sign-up experience)
 
-By default, sign-ups require a **verified email**. Cognito emails a confirmation
-code on sign-up; the user enters it on the in-app confirm-code screen (see
-`references/frontend.md`) before they can log in. This is **secure by default** —
-no unverified accounts, no auto-confirm Lambda. Nothing extra is needed beyond
+Sign-ups require a **verified email**, in every environment. Cognito emails a
+confirmation code on sign-up; the user enters it on the in-app confirm-code screen
+(see `references/frontend.md`) before they can log in. This is **secure by
+default and by construction** — no unverified accounts, no auto-confirm Lambda, no
+flag that turns it off. Nothing extra is needed beyond
 `auto_verified_attributes = ["email"]` on the pool (above) and leaving
 `lambda_config` unset. Configure the message via `verification_message_template`
 and, for production volumes, wire `email_configuration` to SES.
@@ -96,131 +100,34 @@ verification_message_template {
 }
 ```
 
-## Dev/CI override: auto-confirm (development only)
+## No dev/CI bypass — deliberately
 
-Albitor's own autonomous build/verify loop and design-system reviews must be able
-to self-prove the sign-up path **without a real inbox**. For that, and only in a
-**development or CI environment**, wire an auto-confirm pre-sign-up Lambda that
-confirms the user and marks the email verified with no emailed code. This is a
-**dev-only override** — it must never be enabled in production or in the default
-configuration, because it defeats email verification.
+Earlier versions of this pack documented a var-gated `pre_sign_up` auto-confirm
+Lambda (`auth_dev_auto_confirm`) so the build could register a throwaway user with
+no emailed code. **It has been removed, and it must not be reintroduced.**
 
-The trigger is a **Go Lambda on the `provided.al2023` runtime** — the same OS-only
-runtime and prebuilt-`bootstrap` packaging the app's API Lambda already uses, so
-there is no managed-language runtime to age out. (This override previously ran on
-`nodejs20.x`; it was moved to `provided.al2023` to stop the recurring managed-runtime
-EOL churn.) CI already sets up Go and builds the API `bootstrap`; build this one the
-same way — see "Building the bootstrap" below.
+The affordance was legitimate; its location was not. Albitor's loop needs to confirm
+*one throwaway user*; it does not follow that the **shipped user pool** should carry
+a trigger that confirms *everybody*. With self-sign-up on by default and the pool's
+`account_recovery_setting` trusting `verified_email`, an auto-confirm trigger lets
+anyone on the internet mint a `CONFIRMED` account with `email_verified: true` for an
+address they do not control — identity forgery, in the one environment the app is
+actually delivered in. It also removes the honest failure mode: with the trigger a
+bogus sign-up fails *open*, without it a sign-up with no reachable email path simply
+fails *closed*.
 
-Gate it on an explicit variable that defaults to *off* so the override cannot
-leak into a real deployment:
+So do not add any of the following to the app's Terraform:
 
-```hcl
-variable "auth_dev_auto_confirm" {
-  description = "DEV/CI ONLY — auto-confirm sign-ups with no emailed code so the build can self-prove signup without a real inbox. MUST stay false in production/default."
-  type        = bool
-  default     = false # secure by default: real email verification
-}
+- a `variable "auth_dev_auto_confirm"` (or any similarly named flag);
+- a `lambda_config` / `dynamic "lambda_config"` block on `aws_cognito_user_pool.app`;
+- a `pre_sign_up` (or `pre_authentication`) trigger, count-gated or otherwise;
+- a `lambda-src/auto-confirm` module, its `archive_file`, IAM role, log group, invoke
+  permission, or CI build step.
 
-# Count-gated so the Lambda, its zip, and its wiring only exist in dev/CI.
-# archive_file zips the prebuilt bootstrap binary (built in CI — see "Building the
-# bootstrap" below); count-gating it too means a disabled build never needs the
-# binary present, so terraform validate/plan stay green with the override off.
-data "archive_file" "auto_confirm" {
-  count       = var.auth_dev_auto_confirm ? 1 : 0
-  type        = "zip"
-  source_file = "${path.module}/lambda-src/auto-confirm/bootstrap"
-  output_path = "${path.module}/build/auto-confirm.zip"
-}
-
-resource "aws_lambda_function" "auto_confirm" {
-  count            = var.auth_dev_auto_confirm ? 1 : 0
-  function_name    = "${var.app_name}-cognito-auto-confirm-DEVONLY"
-  runtime          = "provided.al2023" # OS-only runtime — no managed-language EOL
-  handler          = "bootstrap"
-  architectures    = ["x86_64"]        # match the API Lambda's go build target
-  role             = aws_iam_role.auto_confirm[0].arn
-  filename         = data.archive_file.auto_confirm[0].output_path
-  source_code_hash = data.archive_file.auto_confirm[0].output_base64sha256
-}
-
-resource "aws_lambda_permission" "cognito_invoke" {
-  count         = var.auth_dev_auto_confirm ? 1 : 0
-  statement_id  = "AllowCognitoInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.auto_confirm[0].function_name
-  principal     = "cognito-idp.amazonaws.com"
-  source_arn    = aws_cognito_user_pool.app.arn
-}
-```
-
-Attach the trigger to the pool **only** when the override is on. Keep the pool's
-base config verification-required; add the `pre_sign_up` trigger conditionally so
-the default deployment never carries it:
-
-```hcl
-# Add to aws_cognito_user_pool.app with a dynamic block so it appears only in dev/CI:
-dynamic "lambda_config" {
-  for_each = var.auth_dev_auto_confirm ? [1] : []
-  content {
-    pre_sign_up = aws_lambda_function.auto_confirm[0].arn
-  }
-}
-```
-
-```go
-// lambda-src/auto-confirm/main.go — DEV/CI ONLY pre-sign-up trigger: confirm
-// every new user, skip the emailed code. Never deploy this outside development.
-package main
-
-import (
-	"context"
-
-	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-lambda-go/lambda"
-)
-
-func handler(_ context.Context, event events.CognitoEventUserPoolsPreSignup) (events.CognitoEventUserPoolsPreSignup, error) {
-	event.Response.AutoConfirmUser = true
-	event.Response.AutoVerifyEmail = true // marks email verified without a code
-	return event, nil
-}
-
-func main() {
-	lambda.Start(handler)
-}
-```
-
-```
-// lambda-src/auto-confirm/go.mod
-module autoconfirm
-
-go 1.25
-
-require github.com/aws/aws-lambda-go v1.49.0
-```
-
-### Building the bootstrap
-
-The `bootstrap` binary is built in CI **before** `terraform plan`/`apply`, exactly
-like the API Lambda — Terraform only zips the prebuilt artifact, it never compiles.
-With the app's existing `actions/setup-go` step in place, add a build for this
-module (only needed when the override is on):
-
-```bash
-cd infrastructure/aws/lambda-src/auto-confirm
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags lambda.norpc -o bootstrap .
-```
-
-Git-ignore the built binary (`infrastructure/aws/lambda-src/auto-confirm/bootstrap`)
-and `infrastructure/aws/build/` — they are CI artifacts, like `api/bootstrap`.
-Unit-test the handler with `go test ./...` (this replaces the old Node `node --test`
-step). `terraform validate` stays green without a build because the count-gated
-`archive_file` isn't read when `auth_dev_auto_confirm` is false.
-
-Set `auth_dev_auto_confirm = true` only in the dev/CI tfvars so Albitor's
-build/verify loop can register and log in a throwaway user end-to-end; production
-and the default leave it `false` and exercise the real confirmation-code flow.
+The test harness confirms its own user instead, from outside the app, using
+credentials CI already holds — `references/verification.md` has the exact steps. The
+only thing the app's Terraform has to provide for that is the
+`cognito_user_pool_id` output, which it already does (below).
 
 ## Outputs the app needs
 
