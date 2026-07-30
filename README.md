@@ -17,7 +17,7 @@ The skill provides:
 - **Terraform** — a Cognito **user pool** + **public app client** (no secret), `USER_PASSWORD_AUTH` flow.
 - **In-app UI** — sign-up, login, confirm-code, and resend screens, styled by the app's chosen design system, **not** the Cognito Hosted UI.
 - **API** — JWT-validation middleware (JWKS signature + issuer/token-use/client/expiry checks) and a protected `GET /api/me`.
-- **Email verification required by default** — secure by default: sign-ups must confirm an emailed code, so the confirm-code/resend screens are on the happy path. A clearly dev/CI-only auto-confirm override lets Albitor's own build/verify loop self-prove signup without a real inbox.
+- **Email verification required in every environment** — secure by default: sign-ups must confirm an emailed code, so the confirm-code/resend screens are on the happy path. There is **no auto-confirm override in the delivered app**; Albitor's own build/verify loop self-proves signup by confirming its own throwaway user through the Cognito admin API from the deploy job, so the shipped user pool is identical to a production one.
 - **Self-sign-up on by default** — the done-criterion is *"a first-time visitor can self-register from the app."*
 
 ### Capability contract
