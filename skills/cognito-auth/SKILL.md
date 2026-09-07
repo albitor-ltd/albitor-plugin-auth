@@ -38,6 +38,8 @@ Four moving parts, each detailed in a bundled reference:
 
 Sign-ups **require a verified email, in every environment** — secure by default. Cognito emails a confirmation code; the user enters it on the in-app confirm-code screen before they can log in. The confirm-code and resend screens are therefore on the **default happy path**, not an opt-in extra.
 
+**Until the delivered app's own AWS account holds a verified Amazon SES identity with SES production access, a real visitor's sign-up cannot complete — they sign up, reach the confirm-code screen, and no code ever arrives.** That is not a volume limit and it is not fixed by a `terraform apply`: `references/terraform.md` has the `email_configuration` block, both failure modes, and the per-account onboarding step that closes it. Say so in the delivery record of any app handed over before the identity exists.
+
 **There is no auto-confirm override in the delivered app, and one must not be added.** Earlier versions of this pack documented a var-gated `pre_sign_up` Lambda (`auth_dev_auto_confirm`) so the build could self-prove signup without an inbox. A trigger that confirms the harness's user confirms *every* visitor's, so with self-sign-up on it let anyone mint a `CONFIRMED`, `email_verified: true` account for an address they do not control — in the one environment the app is actually delivered in. The affordance was legitimate; its location was not.
 
 Albitor's build/verify loop still proves the journey end to end: the deployed e2e spec **confirms its own throwaway user through the Cognito admin API**, using credentials the deploy job already holds — outside the app, with nothing in the app's Terraform to enable it. The delivered user pool is therefore identical to a production pool, and a real visitor's sign-up fails *closed* rather than *open*. `references/terraform.md` has the pool config; `references/verification.md` has the CI steps and permissions.
@@ -50,7 +52,7 @@ Do **not** enable or link to the **Cognito Hosted UI**. The sign-up and login sc
 
 | File | When to read it |
 | --- | --- |
-| `references/terraform.md` | Provisioning the user pool + public app client, the `USER_PASSWORD_AUTH` flow, verification-required in every environment (and why there is no dev bypass), and the outputs the app needs. |
+| `references/terraform.md` | Provisioning the user pool + public app client, the `USER_PASSWORD_AUTH` flow, verification-required in every environment (and why there is no dev bypass), the SES `email_configuration` the pool needs before it can email a real visitor, and the outputs the app needs. |
 | `references/frontend.md` | Building the sign-up / login / confirm-code / resend screens, calling Cognito from the browser, storing and refreshing tokens, and wiring the styling to the chosen design system. |
 | `references/api.md` | The JWT-validation middleware (JWKS verification, issuer/audience/expiry checks), the protected `GET /api/me`, and how the universal `api-auth` security floor sees this. |
 | `references/verification.md` | The done-criterion, the machine-readable skill-declared verification entry (the v1 self-sign-up proof), how the deployed e2e confirms its own throwaway user from CI, and what this pack does *not* prove. |
