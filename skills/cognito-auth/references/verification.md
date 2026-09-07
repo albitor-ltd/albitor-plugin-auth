@@ -156,14 +156,32 @@ Say this plainly rather than letting a green check imply otherwise:
   Admin-confirm skips it, exactly as the removed override did. Verification proves that
   the confirm screen is reached and that a confirmed account can sign in — it does not
   prove Cognito can send mail from this pool, or that the code the user receives works.
-- **The app's outbound email path is unexercised.** If the pool has no
-  `email_configuration`, Cognito falls back to `COGNITO_DEFAULT`, which AWS documents as
-  a low-volume test-only sender; a pool wired to SES in a sandboxed account can only
-  mail verified identities. Neither condition is detected by anything here.
+- **The app's outbound email path is unexercised, and by default there is not one.**
+  With no `email_configuration`, Cognito falls back to `COGNITO_DEFAULT`, whose daily
+  cap AWS documents as below what a typical production environment needs; wired to SES
+  in an account still in the SES sandbox, the pool reaches only identities already
+  verified in that account. A delivered app in either state can email **no real
+  visitor at all** — it is not a low-volume path, it is no path. Neither condition is
+  detected by anything here; `references/terraform.md` has the figures, the
+  `email_configuration` block, and the onboarding step that fixes it.
+
+### What "pending" blocks, and for whom
 
 Proving the emailed step for real needs a mailbox the loop can read (an SES receipt
-rule into S3, or a per-build throwaway inbox) and a working sending identity. That is
-the upgrade path; nothing above is blocked while it is pending.
+rule into S3, or a per-build throwaway inbox) **and** a working sending identity. Be
+precise about what that pending state blocks.
+
+Nothing in this pack's own checks is blocked: the skill-declared check, the deployed
+e2e, and the delivery all pass without a single email leaving the pool, because the
+harness confirms its own user through the admin API.
+
+**Every real visitor is blocked.** Until the app's own AWS account holds a verified SES
+identity with SES production access, a person who signs up gets no code, cannot
+confirm, and cannot log in — the app has working authentication that only the deploy
+job can complete. A green check here means the wiring is right, not that the app can
+enrol a user. Record that gap in the delivery record and the README of any app handed
+over before the identity exists, and clear it with the onboarding step in
+`references/terraform.md`.
 
 ## Machine-readable declaration
 
@@ -186,6 +204,10 @@ albitor-skill-verification:
   not_proven:
     - emailed-confirmation-code             # admin-confirm skips it; the code is never delivered or entered during verification
     - outbound-email-delivery               # COGNITO_DEFAULT / SES sending identity is never exercised
+  requires_sending_identity: ses-identity-verified-in-the-app-account-with-production-access
+  # Until that exists, a real visitor's sign-up cannot complete: no code arrives.
+  # Onboarding work per AWS account (customer's own domain, customer's own account);
+  # not a Terraform change and not detected by any check above.
   checks:
     - id: self-signup-wired-renders-and-reachable
       description: "Sign-up API path is wired, a sign-up route renders, and it is reachable from the login page."

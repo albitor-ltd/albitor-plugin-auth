@@ -18,6 +18,7 @@ The skill provides:
 - **In-app UI** — sign-up, login, confirm-code, and resend screens, styled by the app's chosen design system, **not** the Cognito Hosted UI.
 - **API** — JWT-validation middleware (JWKS signature + issuer/token-use/client/expiry checks) and a protected `GET /api/me`.
 - **Email verification required in every environment** — secure by default: sign-ups must confirm an emailed code, so the confirm-code/resend screens are on the happy path. There is **no auto-confirm override in the delivered app**; Albitor's own build/verify loop self-proves signup by confirming its own throwaway user through the Cognito admin API from the deploy job, so the shipped user pool is identical to a production one.
+- **No email path until the app's AWS account has one** — until that account holds a verified Amazon SES identity with SES production access, a real visitor's sign-up cannot complete: they sign up, reach the confirm-code screen, and no code arrives. It is no email path rather than a low-volume one, the sending domain is the customer's own verified in the customer's own account, and the fix is an onboarding step per account — the skill's `references/terraform.md` carries the `email_configuration` block and both failure modes.
 - **Self-sign-up on by default** — the done-criterion is *"a first-time visitor can self-register from the app."*
 
 ### Capability contract
