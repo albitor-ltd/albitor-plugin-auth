@@ -157,13 +157,13 @@ Say this plainly rather than letting a green check imply otherwise:
   the confirm screen is reached and that a confirmed account can sign in — it does not
   prove Cognito can send mail from this pool, or that the code the user receives works.
 - **The app's outbound email path is unexercised, and by default there is not one.**
-  With no `email_configuration`, Cognito falls back to `COGNITO_DEFAULT`, whose daily
-  cap AWS documents as below what a typical production environment needs; wired to SES
-  in an account still in the SES sandbox, the pool reaches only identities already
-  verified in that account. A delivered app in either state can email **no real
-  visitor at all** — it is not a low-volume path, it is no path. Neither condition is
-  detected by anything here; `references/terraform.md` has the figures, the
-  `email_configuration` block, and the onboarding step that fixes it.
+  With `cognito_email_from` and `cognito_email_ses_identity_arn` empty, the pool uses
+  `COGNITO_DEFAULT`, whose 50-a-day cap is per AWS account and shared by every pool in
+  it; set in an account still in the SES sandbox, the pool reaches only identities
+  already verified in that account. A delivered app in either state can email **no
+  real visitor at all** — it is not a low-volume path, it is no path. Neither condition
+  is detected by anything here; `references/terraform.md` has the figures, the two
+  variables, and the onboarding step that fixes it.
 
 ### What "pending" blocks, and for whom
 

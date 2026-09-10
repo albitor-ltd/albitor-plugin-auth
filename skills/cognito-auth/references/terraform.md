@@ -41,6 +41,16 @@ resource "aws_cognito_user_pool" "app" {
   # auto-confirms would defeat email verification for every visitor, not just the
   # test harness. CI confirms its own test user out-of-band — see verification.md.
 
+  # Outbound email. With both cognito_email_* variables set, the pool sends through
+  # the account's own verified SES identity; with either empty it falls back to
+  # Cognito's default sender, which AWS caps at 50 messages a day per AWS account,
+  # shared by every pool in the account. See "Sending through SES" below.
+  email_configuration {
+    email_sending_account = local.cognito_ses_email ? "DEVELOPER" : "COGNITO_DEFAULT"
+    from_email_address    = local.cognito_ses_email ? var.cognito_email_from : null
+    source_arn            = local.cognito_ses_email ? var.cognito_email_ses_identity_arn : null
+  }
+
   account_recovery_setting {
     recovery_mechanism {
       name     = "verified_email"
@@ -67,9 +77,9 @@ resource "aws_cognito_user_pool_client" "spa" {
   # Hosted UI is NOT used — the app renders its own sign-up/login screens.
   # No callback_urls / allowed_oauth_flows needed for USER_PASSWORD_AUTH.
 
-  access_token_validity  = 60  # minutes
-  id_token_validity      = 60  # minutes
-  refresh_token_validity = 30  # days
+  access_token_validity  = 60 # minutes
+  id_token_validity      = 60 # minutes
+  refresh_token_validity = 30 # days
   token_validity_units {
     access_token  = "minutes"
     id_token      = "minutes"
@@ -104,22 +114,26 @@ verification_message_template {
 
 Read this before calling the auth pack delivered. Sign-up cannot complete without the
 emailed code, so a pool that cannot send mail to a stranger is a pool nobody outside
-the deploy job can enrol in. **A delivered app with no `email_configuration` and no SES
-production access has no usable email path at all — not a low-volume one.** The visitor
-signs up, the app routes them to the confirm-code screen, and no code ever arrives.
+the deploy job can enrol in. **A delivered app with the `cognito_email_*` variables
+unset, or set in an account without SES production access, has no usable email path at
+all — not a low-volume one.** The visitor signs up, the app routes them to the
+confirm-code screen, and no code ever arrives.
 
 Two distinct failure modes produce that, and a new deployment usually starts in the
 first and passes through the second:
 
-1. **No `email_configuration` on the pool.** Cognito falls back to its own default
-   sender, `COGNITO_DEFAULT` (`no-reply@verificationemail.com`). AWS documents that
-   quota as **50 email messages sent daily per AWS account**, resetting at 09:00 UTC
-   and **not adjustable**, and says of it: "For typical production environments, the
-   default email limit is below the required delivery volume." Confirm the current
-   figure on the [Cognito quotas
+1. **`cognito_email_from` and `cognito_email_ses_identity_arn` left empty.** The pool
+   uses Cognito's own default sender, `COGNITO_DEFAULT` (`no-reply@verificationemail.com`).
+   AWS documents that quota as **50 email messages sent daily per AWS account**,
+   resetting at 09:00 UTC and **not adjustable**, and says of it: "For typical
+   production environments, the default email limit is below the required delivery
+   volume." The cap is per account, not per pool: every app deployed into the account
+   shares it, and on 2026-09-10 three apps' verifiers exhausted one account's allowance
+   between them and sign-up stopped for all three. Confirm the current figure on the
+   [Cognito quotas
    page](https://docs.aws.amazon.com/cognito/latest/developerguide/quotas.html) before
    quoting it — it moves.
-2. **`email_configuration` wired to SES, in an account still in the SES sandbox.** A
+2. **Both variables set, in an account still in the SES sandbox.** A
    sandboxed account can send only to email addresses and domains already verified in
    that account, or to the SES mailbox simulator — at most 200 messages per 24 hours
    and 1 message per second. Every real visitor's address is unverified, so every real
@@ -131,19 +145,58 @@ account**. Neither state can confirm a stranger's sign-up, and nothing in this p
 verification detects either — the deployed e2e confirms its own user through the admin
 API and never sends mail (`references/verification.md`).
 
-## The `email_configuration` block, and what the deployment must supply
+## Sending through SES: the two variables the deployment must set
+
+The pool resource above carries one `email_configuration` block that switches on two
+variables. Declare them in the app's Terraform exactly as below — the names are part of
+the pack's contract, so the deploy job and the app's own docs can refer to them.
 
 ```hcl
-# In aws_cognito_user_pool.app — send through the account's own SES identity.
-email_configuration {
-  email_sending_account  = "DEVELOPER"             # this account's SES, not COGNITO_DEFAULT
-  source_arn             = var.ses_identity_arn    # arn:aws:ses:<region>:<account>:identity/<domain>
-  from_email_address     = var.auth_from_email     # e.g. "Example <no-reply@example.com>"
-  reply_to_email_address = var.auth_reply_to_email # optional
+variable "cognito_email_from" {
+  description = "Verified From address for the user pool's email (e.g. \"no-reply@example.com\" or \"Example <no-reply@example.com>\"). Empty keeps Cognito's default sender."
+  type        = string
+  default     = ""
+}
+
+variable "cognito_email_ses_identity_arn" {
+  description = "ARN of the verified SES identity (domain or address) in the same Region as the user pool, e.g. arn:aws:ses:eu-west-2:123456789012:identity/example.com. Empty keeps Cognito's default sender."
+  type        = string
+  default     = ""
+
+  validation { # cross-variable reference: needs Terraform >= 1.9
+    condition     = (var.cognito_email_ses_identity_arn == "") == (var.cognito_email_from == "")
+    error_message = "Set cognito_email_from and cognito_email_ses_identity_arn together, or leave both empty."
+  }
+}
+
+locals {
+  # SES-backed sending is on only when both variables are set.
+  cognito_ses_email = var.cognito_email_from != "" && var.cognito_email_ses_identity_arn != ""
 }
 ```
 
-Terraform wires the block. It cannot create the two things the block depends on:
+With both set, the block resolves to `email_sending_account = "DEVELOPER"`,
+`from_email_address = var.cognito_email_from`, `source_arn =
+var.cognito_email_ses_identity_arn`. With either empty it resolves to
+`email_sending_account = "COGNITO_DEFAULT"` and the two addresses are null — the same
+pool the pack produced before the variables existed. **A production app must set both.**
+The default sender is for a build's own smoke test and nothing else: its 50-a-day cap is
+per AWS account, so every pool in the account draws on the same allowance, and one busy
+pool's verifiers empty it for all of them.
+
+Add `reply_to_email_address` to the block only if the app needs replies routed
+somewhere; it is optional and the pack does not require a variable for it.
+
+**What the pool sends, and what it must not.** Set the identity up, and describe it in
+the delivered app's own documentation, as sending **account, two-factor authentication,
+and account-recovery email only** — sign-up confirmation codes, MFA codes, and
+forgotten-password codes. No marketing, no notifications, no mail the visitor did not
+just trigger. That is the basis on which SES production access is requested for the
+account (`--mail-type TRANSACTIONAL`), and the app's docs must say so plainly so that a
+later change to send anything else is recognised as a change to that basis, not an
+addition to a channel that already exists.
+
+Terraform wires the block. It cannot create the two things the variables point at:
 
 - **A verified SES identity in the app's own AWS account.** The account's owner
   verifies a domain (or a single address) by publishing the DNS records SES issues. The
@@ -163,7 +216,8 @@ makes Cognito create a service-linked role, so whoever applies the Terraform nee
 
 Both SES steps are **onboarding work for the AWS account**, done once per account and
 per Region, before or alongside the first delivery into it. They are not part of an
-app's build, and they cannot be done from inside one.
+app's build, and they cannot be done from inside one. Once they are done, the two
+variables are the only thing a deployment has to set.
 
 ## Whose domain sends
 
