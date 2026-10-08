@@ -1,0 +1,219 @@
+// Sign-in for the web app, rendered by the cognito-auth pack.
+//
+// The route picks the screen: /sign-in, /sign-up, /confirm and /reset show
+// their screen; anything else asks GET /api/me who is signed in and shows the
+// app, or sends the visitor to /sign-in and back again afterwards.
+//
+// Every call goes to this app's own API (/api/auth/*), which talks to Cognito
+// and keeps the session in HttpOnly cookies. Nothing here sees a token.
+
+const SCREENS = {
+  "/sign-in": "sign-in-screen",
+  "/sign-up": "sign-up-screen",
+  "/confirm": "confirm-screen",
+  "/reset": "reset-screen",
+};
+
+const byTestId = (id) => document.querySelector(`[data-testid="${id}"]`);
+const params = new URLSearchParams(window.location.search);
+
+// safeNext returns where to go after signing in: a path on this site, never
+// another origin. It parses the value the way the browser will rather than
+// pattern-matching it: a prefix check misses "/\t/evil.example", whose tab the
+// browser strips into "//evil.example". Anything that resolves off this origin,
+// or does not parse, goes home.
+function safeNext() {
+  const next = params.get("next") || "/";
+  try {
+    const url = new URL(next, window.location.origin);
+    return url.origin === window.location.origin ? url.pathname + url.search + url.hash : "/";
+  } catch {
+    return "/";
+  }
+}
+
+// showScreen shows one sign-in screen and names the tab after it.
+function showScreen(testId) {
+  const screen = byTestId(testId);
+  screen.hidden = false;
+  document.title = `${screen.querySelector("h1").textContent} – ${document.title}`;
+}
+
+function showError(testId, message) {
+  const el = byTestId(testId);
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+async function post(action, body) {
+  const res = await fetch(`/api/auth/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(body),
+  });
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {
+    // 204 has no body.
+  }
+  return { ok: res.ok, status: res.status, code: data.code || "", message: data.error || "" };
+}
+
+// onSubmit wires a form: the button is disabled while the call is out, and a
+// failure lands in the form's error region instead of being swallowed.
+function onSubmit(formId, errorId, handler) {
+  const form = byTestId(formId);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = form.querySelector('button[type="submit"]');
+    button.disabled = true;
+    showError(errorId, "");
+    try {
+      await handler(new FormData(form));
+    } catch {
+      showError(errorId, "Something went wrong. Check your connection and try again.");
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+function goTo(path, email) {
+  const query = new URLSearchParams();
+  if (email) query.set("email", email);
+  if (params.get("next")) query.set("next", safeNext());
+  const qs = query.toString();
+  window.location.assign(qs ? `${path}?${qs}` : path);
+}
+
+function prefillEmail(inputId) {
+  const email = params.get("email");
+  if (email) byTestId(inputId).value = email;
+}
+
+function signInScreen() {
+  prefillEmail("sign-in-email");
+  onSubmit("sign-in-form", "sign-in-error", async (data) => {
+    const email = String(data.get("email") || "").trim();
+    const result = await post("sign-in", { email, password: data.get("password") });
+    if (result.ok) {
+      window.location.assign(safeNext());
+    } else if (result.code === "not_confirmed") {
+      goTo("/confirm", email);
+    } else {
+      showError("sign-in-error", result.message || "Sign-in failed.");
+    }
+  });
+}
+
+function signUpScreen() {
+  onSubmit("sign-up-form", "sign-up-error", async (data) => {
+    const email = String(data.get("email") || "").trim();
+    const result = await post("sign-up", { email, password: data.get("password") });
+    if (result.ok) {
+      goTo("/confirm", email);
+    } else {
+      showError("sign-up-error", result.message || "Sign-up failed.");
+    }
+  });
+}
+
+function confirmScreen() {
+  prefillEmail("confirm-email");
+  onSubmit("confirm-form", "confirm-error", async (data) => {
+    const email = String(data.get("email") || "").trim();
+    const result = await post("confirm", { email, code: String(data.get("code") || "").trim() });
+    if (result.ok) {
+      goTo("/sign-in", email);
+    } else {
+      showError("confirm-error", result.message || "That code did not work.");
+    }
+  });
+  byTestId("confirm-resend").addEventListener("click", async () => {
+    const email = byTestId("confirm-email").value.trim();
+    const status = byTestId("confirm-status");
+    status.hidden = true;
+    const result = await post("resend", { email });
+    if (result.ok) {
+      status.textContent = "We have sent a new code.";
+      status.hidden = false;
+      showError("confirm-error", "");
+    } else {
+      showError("confirm-error", result.message || "Could not send a new code.");
+    }
+  });
+}
+
+function resetScreen() {
+  prefillEmail("reset-email");
+  let email = "";
+  onSubmit("reset-request-form", "reset-request-error", async (data) => {
+    email = String(data.get("email") || "").trim();
+    const result = await post("forgot", { email });
+    if (result.ok) {
+      byTestId("reset-request-form").hidden = true;
+      byTestId("reset-form").hidden = false;
+      byTestId("reset-code").focus();
+    } else {
+      showError("reset-request-error", result.message || "Could not send a code.");
+    }
+  });
+  onSubmit("reset-form", "reset-error", async (data) => {
+    const result = await post("reset", {
+      email,
+      code: String(data.get("code") || "").trim(),
+      password: data.get("password"),
+    });
+    if (result.ok) {
+      goTo("/sign-in", email);
+    } else {
+      showError("reset-error", result.message || "Could not reset the password.");
+    }
+  });
+}
+
+// showApp shows the app to a signed-in visitor and only then starts it, so the
+// app's own calls are never made without a session.
+function showApp(me) {
+  byTestId("app-root").hidden = false;
+  if (!me.local) {
+    byTestId("signed-in-as").textContent = me.email || "";
+    const signOut = byTestId("sign-out-button");
+    signOut.hidden = false;
+    signOut.addEventListener("click", async () => {
+      await post("sign-out", {});
+      window.location.assign("/sign-in");
+    });
+  }
+  const app = document.createElement("script");
+  app.src = "/app.js";
+  document.body.appendChild(app);
+}
+
+async function start() {
+  const path = window.location.pathname.replace(/\/+$/, "") || "/";
+  const screen = SCREENS[path];
+  if (screen) {
+    showScreen(screen);
+    ({ "/sign-in": signInScreen, "/sign-up": signUpScreen, "/confirm": confirmScreen, "/reset": resetScreen })[
+      path
+    ]();
+    return;
+  }
+  try {
+    const res = await fetch("/api/me", { credentials: "same-origin" });
+    if (res.status === 401) {
+      const next = `${window.location.pathname}${window.location.search}`;
+      window.location.replace(`/sign-in?next=${encodeURIComponent(next)}`);
+      return;
+    }
+    showApp(res.ok ? await res.json() : { local: true });
+  } catch {
+    // The API is unreachable: show the app, whose health badge says so.
+    showApp({ local: true });
+  }
+}
+
+start();

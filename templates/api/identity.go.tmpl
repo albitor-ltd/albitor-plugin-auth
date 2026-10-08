@@ -1,0 +1,184 @@
+package server
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+)
+
+// THIS FILE IS THE API IDENTITY SEAM, rendered by the cognito-auth pack when
+// the repository was created. It replaced the starter's pass-through version:
+// every /api/ request now needs a verified sign-in, except /api/health and the
+// sign-in calls themselves. The Store interface is unchanged — every user-owned
+// call already takes its owner from ownerFromRequest, which now answers the
+// signed-in person's `sub`.
+//
+// The pieces:
+//   - identity.go (this file): withIdentity, ownerFromRequest, GET /api/me.
+//   - auth_token.go: verifies a Cognito token against the pool's JWKS.
+//   - auth_cognito.go: where the pool comes from, and POST /api/auth/* — the
+//     sign-in, sign-up, confirm-code and reset calls the web app makes.
+//
+// The session lives in two HttpOnly cookies the API sets, so no token is ever
+// readable by the page's JavaScript. A script (scripts/seed-journey-fixtures.sh)
+// or another client may send `Authorization: Bearer <token>` instead.
+
+// AnonymousOwner owns every record when the API runs with no sign-in at all: a
+// local run (ALBITOR_LOCAL=1) and the package's own tests. A deployed function
+// always has sign-in, and never acts as this owner.
+const AnonymousOwner = "anonymous"
+
+// Identity is the verified person a request acts for.
+type Identity struct {
+	Sub   string `json:"sub"`
+	Email string `json:"email,omitempty"`
+}
+
+type identityKey struct{}
+
+// identityFromContext returns the verified identity withIdentity put on the
+// request, if there is one.
+func identityFromContext(ctx context.Context) (Identity, bool) {
+	id, ok := ctx.Value(identityKey{}).(Identity)
+	return id, ok && id.Sub != ""
+}
+
+// withIdentity wraps every request before it reaches a handler. It verifies the
+// request's token, refuses an /api/ request with no verified identity (leaving
+// /api/health and the sign-in calls open), serves GET /api/me, and puts the
+// verified identity where ownerFromRequest reads it.
+//
+// Where the pool comes from is decided once, here, from the environment: see
+// authSourceFromEnv. With no pool configured and no deployed function — a local
+// run or a unit test — requests pass through as AnonymousOwner.
+func withIdentity(next http.Handler) http.Handler {
+	return newIdentityGate(next, authSourceFromEnv(os.Getenv), slog.Default())
+}
+
+// ownerFromRequest names the user a request acts for: the verified token's
+// `sub`. Every user-owned store call takes its answer, so records are scoped by
+// user. Never take the owner from the request body or a query parameter: that
+// lets one user name another.
+func ownerFromRequest(r *http.Request) string {
+	if id, ok := identityFromContext(r.Context()); ok {
+		return id.Sub
+	}
+	return AnonymousOwner
+}
+
+// identityGate is withIdentity's handler.
+type identityGate struct {
+	next   http.Handler
+	source *authSource
+	logger *slog.Logger
+}
+
+func newIdentityGate(next http.Handler, source *authSource, logger *slog.Logger) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &identityGate{next: next, source: source, logger: logger}
+}
+
+// The paths the gate itself answers or leaves open.
+const (
+	healthPath   = "/api/health"
+	mePath       = "/api/me"
+	authPathRoot = "/api/auth/"
+)
+
+func (g *identityGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if !strings.HasPrefix(path, "/api/") || path == healthPath {
+		g.next.ServeHTTP(w, r)
+		return
+	}
+
+	if g.source == nil {
+		g.serveWithoutSignIn(w, r)
+		return
+	}
+
+	// A route the API does not have answers 404 to everyone, as it would with
+	// no sign-in: there is nothing behind it to protect, and the deploy's smoke
+	// check expects an unknown /api/ path to be a JSON 404.
+	if path != mePath && !strings.HasPrefix(path, authPathRoot) && unknownRoute(g.next, r) {
+		g.next.ServeHTTP(w, r)
+		return
+	}
+
+	auth, err := g.source.get(r.Context())
+	if err != nil {
+		// Fail closed: with no pool to check against, nothing is let through.
+		g.logger.ErrorContext(r.Context(), "sign-in is not configured",
+			slog.String("correlation_id", CorrelationIDFromContext(r.Context())),
+			slog.String("error", err.Error()))
+		writeError(w, http.StatusServiceUnavailable, "sign-in is unavailable")
+		return
+	}
+
+	if strings.HasPrefix(path, authPathRoot) {
+		auth.serveAuth(w, r, g.logger)
+		return
+	}
+
+	id, ok := auth.authenticate(w, r, g.logger)
+	if !ok {
+		return // authenticate has answered: 401, or 503 when the keys are unreachable
+	}
+	r = r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
+
+	if path == mePath {
+		serveMe(w, r, id)
+		return
+	}
+	g.next.ServeHTTP(w, r)
+}
+
+// serveWithoutSignIn answers a local run or a unit test, which has no pool:
+// every request acts as AnonymousOwner, and the sign-in calls say they are not
+// available rather than pretending to work.
+func (g *identityGate) serveWithoutSignIn(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == mePath:
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"sub": AnonymousOwner, "local": true})
+	case strings.HasPrefix(r.URL.Path, authPathRoot):
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "sign-in is not available in a local run", "code": "local",
+		})
+	default:
+		g.next.ServeHTTP(w, r)
+	}
+}
+
+// serveMe is GET /api/me: who the session belongs to.
+func serveMe(w http.ResponseWriter, r *http.Request, id Identity) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, id)
+}
+
+// routeMatcher is the part of *http.ServeMux unknownRoute needs.
+type routeMatcher interface {
+	Handler(r *http.Request) (http.Handler, string)
+}
+
+// unknownRoute reports whether next would answer r from its catch-all "/"
+// pattern — the starter's JSON 404. Anything else, including a handler this
+// cannot inspect, is treated as a real route and protected.
+func unknownRoute(next http.Handler, r *http.Request) bool {
+	m, ok := next.(routeMatcher)
+	if !ok {
+		return false
+	}
+	_, pattern := m.Handler(r)
+	return pattern == "/"
+}

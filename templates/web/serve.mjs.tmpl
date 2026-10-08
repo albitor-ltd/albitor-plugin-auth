@@ -1,0 +1,112 @@
+// Dependency-free static file server with an /api/* reverse proxy.
+// Serves ./public on STATIC_PORT (default 3000) and proxies any request whose
+// path starts with /api/ to http://127.0.0.1:<API_PORT> (default 8080).
+//
+// API_ORIGIN overrides that target with an ABSOLUTE origin — e.g.
+// https://d111.cloudfront.net — so the bundle in ./public can be exercised
+// against an API that is already deployed. That is how .github/workflows/
+// deploy.yml verifies a release BEFORE it ships the bundle to S3: the front end
+// under test is the new one, served here, and the API behind it is the one
+// terraform apply has just shipped. Without it the only way to browse a new
+// bundle is to publish it first, which is what put 25 red deploys in front of
+// real users.
+import http from "node:http";
+import https from "node:https";
+import { readFile } from "node:fs/promises";
+import { join, normalize, extname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = join(__dirname, "public");
+const STATIC_PORT = Number(process.env.STATIC_PORT || "3000");
+const API_PORT = Number(process.env.API_PORT || "8080");
+const API_ORIGIN = (process.env.API_ORIGIN || "").trim();
+
+const CONTENT_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+};
+
+// Resolve API_ORIGIN once, at start-up, so a malformed value fails loudly here
+// rather than as a 502 on every request.
+const apiTarget = (() => {
+  if (!API_ORIGIN) {
+    return { transport: http, host: "127.0.0.1", port: API_PORT, headers: {} };
+  }
+  const url = new URL(API_ORIGIN);
+  const secure = url.protocol === "https:";
+  return {
+    transport: secure ? https : http,
+    host: url.hostname,
+    port: Number(url.port || (secure ? 443 : 80)),
+    // The upstream picks its certificate and its route from Host, so it must
+    // name the origin rather than this server. Everything else the browser sent
+    // is forwarded untouched.
+    headers: { host: url.host },
+  };
+})();
+
+function proxyToApi(req, res) {
+  const options = {
+    host: apiTarget.host,
+    port: apiTarget.port,
+    method: req.method,
+    path: req.url,
+    headers: { ...req.headers, ...apiTarget.headers },
+  };
+  const proxyReq = apiTarget.transport.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+  proxyReq.on("error", () => {
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "bad gateway" }));
+  });
+  req.pipe(proxyReq);
+}
+
+async function serveStatic(req, res) {
+  // Map "/" to index.html; reject path traversal.
+  //
+  // A path whose last segment has no extension is a route of the single-page
+  // app (/sign-in, /items/42), not a file, so it gets the shell — exactly what
+  // the CloudFront router (infrastructure/aws/functions/spa-router.js) does in
+  // production. Without it a deep link that works deployed 404s here, and the
+  // pre-ship verify cannot reach the sign-in screen it signs in through.
+  let urlPath = decodeURIComponent((req.url || "/").split("?")[0]);
+  const lastSegment = urlPath.substring(urlPath.lastIndexOf("/") + 1);
+  if (urlPath === "/" || !lastSegment.includes(".")) urlPath = "/index.html";
+  const safePath = normalize(urlPath).replace(/^(\.\.[/\\])+/, "");
+  const filePath = join(PUBLIC_DIR, safePath);
+
+  if (!filePath.startsWith(PUBLIC_DIR)) {
+    res.writeHead(403);
+    res.end("forbidden");
+    return;
+  }
+
+  try {
+    const data = await readFile(filePath);
+    const type = CONTENT_TYPES[extname(filePath)] || "application/octet-stream";
+    res.writeHead(200, { "Content-Type": type });
+    res.end(data);
+  } catch {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("not found");
+  }
+}
+
+const server = http.createServer((req, res) => {
+  if ((req.url || "").startsWith("/api/")) {
+    proxyToApi(req, res);
+    return;
+  }
+  serveStatic(req, res);
+});
+
+server.listen(STATIC_PORT, () => {
+  const target = API_ORIGIN || `:${API_PORT}`;
+  console.log(`static server listening on http://localhost:${STATIC_PORT} (proxy -> ${target})`);
+});

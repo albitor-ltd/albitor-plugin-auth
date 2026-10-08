@@ -1,114 +1,44 @@
-Distilled reference for the `cognito-auth` skill. Amazon Cognito changes; verify exact argument names and defaults against the Terraform AWS provider docs (`aws_cognito_user_pool`, `aws_cognito_user_pool_client`) and the Cognito developer guide before shipping.
+Reference for the `cognito-auth` skill. The Terraform itself is
+`templates/infrastructure/auth.tf.tmpl`, rendered into a new app as `infrastructure/aws/auth.tf`;
+this page explains what it cannot.
 
-# Terraform: Cognito user pool + public app client
+# Terraform: the user pool, the client and email sending
 
-The identity provider for the auth pack. Two resources, and only two — a **user pool** (the directory of accounts) and a **public app client** (how the browser talks to it).
+**There is no dev/CI variant of this Terraform.** The pool you ship is the pool you would ship in
+production: email verification required, no `lambda_config`, no `pre_sign_up` trigger, no
+variable that can turn any of that off. The build proves sign-in with the per-deploy seeded
+verifier account, which needs nothing in the pool but `ALLOW_USER_PASSWORD_AUTH` on the client
+(see `references/verification.md`).
 
-**There is no dev/CI variant of this Terraform.** The pool you ship is the pool you would ship in production: email verification required, no `lambda_config`, no `pre_sign_up` trigger, no variable that can turn any of that off. Albitor's build/verify loop still proves the sign-up journey end to end — it does it by confirming its own throwaway user through the Cognito **admin API from the deploy job**, which needs nothing in the app's infrastructure. See `references/verification.md`.
+## What the rendered `auth.tf` holds
 
-## What "public app client" means and why it matters
+- `aws_cognito_user_pool.auth` — email as the username (case-insensitive), email verification by
+  code, MFA off, account recovery by verified email, and this password policy:
 
-The app is a browser SPA. A browser cannot keep a client secret, so the app client is created **without a secret** (`generate_secret = false`, the default) and uses the `USER_PASSWORD_AUTH` auth flow. If you generate a secret, `USER_PASSWORD_AUTH` from the browser fails with `SECRET_HASH` errors — so never add one for the SPA client.
-
-## User pool
-
-```hcl
-resource "aws_cognito_user_pool" "app" {
-  name = "${var.app_name}-users"
-
-  # Sign in with an email address.
-  username_attributes      = ["email"]
-  auto_verified_attributes = ["email"] # DEFAULT: email must be verified by a confirmation code
-
+  ```hcl
   password_policy {
-    minimum_length    = 8
+    minimum_length    = 12 # ASVS 2.1.1
     require_lowercase = true
-    require_numbers   = true
     require_uppercase = true
+    require_numbers   = true
     require_symbols   = false
   }
+  ```
 
-  schema {
-    name                = "email"
-    attribute_data_type = "String"
-    required            = true
-    mutable             = true
-  }
-
-  # Real email verification, in EVERY environment — Cognito emails a confirmation
-  # code and the user confirms via the in-app confirm-code screen. Deliberately no
-  # lambda_config and no pre_sign_up trigger: a pre-sign-up trigger that
-  # auto-confirms would defeat email verification for every visitor, not just the
-  # test harness. CI confirms its own test user out-of-band — see verification.md.
-
-  # Outbound email. With both cognito_email_* variables set, the pool sends through
-  # the account's own verified SES identity; with either empty it falls back to
-  # Cognito's default sender, which AWS caps at 50 messages a day per AWS account,
-  # shared by every pool in the account. See "Sending through SES" below.
-  email_configuration {
-    email_sending_account = local.cognito_ses_email ? "DEVELOPER" : "COGNITO_DEFAULT"
-    from_email_address    = local.cognito_ses_email ? var.cognito_email_from : null
-    source_arn            = local.cognito_ses_email ? var.cognito_email_ses_identity_arn : null
-  }
-
-  account_recovery_setting {
-    recovery_mechanism {
-      name     = "verified_email"
-      priority = 1
-    }
-  }
-}
-```
-
-## Public app client
-
-```hcl
-resource "aws_cognito_user_pool_client" "spa" {
-  name         = "${var.app_name}-spa"
-  user_pool_id = aws_cognito_user_pool.app.id
-
-  generate_secret = false # public client — browser SPA, no secret
-
-  explicit_auth_flows = [
-    "ALLOW_USER_PASSWORD_AUTH", # login with username + password
-    "ALLOW_REFRESH_TOKEN_AUTH", # silent token refresh
-  ]
-
-  # Hosted UI is NOT used — the app renders its own sign-up/login screens.
-  # No callback_urls / allowed_oauth_flows needed for USER_PASSWORD_AUTH.
-
-  access_token_validity  = 60 # minutes
-  id_token_validity      = 60 # minutes
-  refresh_token_validity = 30 # days
-  token_validity_units {
-    access_token  = "minutes"
-    id_token      = "minutes"
-    refresh_token = "days"
-  }
-
-  prevent_user_existence_errors = "ENABLED"
-}
-```
-
-## Email verification (the default sign-up experience)
-
-Sign-ups require a **verified email**, in every environment. Cognito emails a
-confirmation code on sign-up; the user enters it on the in-app confirm-code screen
-(see `references/frontend.md`) before they can log in. This is **secure by
-default and by construction** — no unverified accounts, no auto-confirm Lambda, no
-flag that turns it off. Nothing extra is needed beyond
-`auto_verified_attributes = ["email"]` on the pool (above) and leaving
-`lambda_config` unset. Customise the message with
-`verification_message_template`.
-
-```hcl
-# In aws_cognito_user_pool.app — customise the emailed code message (optional):
-verification_message_template {
-  default_email_option = "CONFIRM_WITH_CODE"
-  email_subject        = "Your ${var.app_name} verification code"
-  email_message        = "Your verification code is {####}"
-}
-```
+  The platform's floor gate refuses fewer than eight characters, or lowercase, uppercase or
+  numbers not required. The seeded demo and verifier passwords are 24 characters holding every
+  class, so they meet any policy up to that.
+- `aws_cognito_user_pool_client.web` — public (no secret), `ALLOW_USER_PASSWORD_AUTH`,
+  `ALLOW_USER_SRP_AUTH`, `ALLOW_REFRESH_TOKEN_AUTH`, `prevent_user_existence_errors = "ENABLED"`,
+  token revocation on, 60-minute ID and access tokens, 30-day refresh token.
+- `aws_ssm_parameter.auth_config` — `/<api function name>/auth/config`, a plain JSON
+  `{region, user_pool_id, client_id}` the API reads at cold start, and an
+  `aws_iam_role_policy` letting the API's role read that one parameter. `lambda.tf` is the
+  starter's, so the pool's ids reach the API this way rather than as environment variables.
+- Outputs `auth_user_pool_id` and `auth_client_id`. The deploy workflow reads them, seeds the
+  demo and verifier accounts into the pool under the deploy identity, and reports both on the
+  deploy receipt. These names are the starter's auth seam (seam version 1); do not rename them.
+- Variables `cognito_email_from` and `cognito_email_ses_identity_arn`, below.
 
 ## The pool has no usable email path until the account has a verified SES identity
 
@@ -142,14 +72,14 @@ first and passes through the second:
 The default sender is therefore a **test** sender rather than a small production one,
 and SES without production access reaches **only people already verified in the
 account**. Neither state can confirm a stranger's sign-up, and nothing in this pack's
-verification detects either — the deployed e2e confirms its own user through the admin
-API and never sends mail (`references/verification.md`).
+verification detects either — the build signs in as a seeded account and never sends mail
+(`references/verification.md`).
 
 ## Sending through SES: the two variables the deployment must set
 
-The pool resource above carries one `email_configuration` block that switches on two
-variables. Declare them in the app's Terraform exactly as below — the names are part of
-the pack's contract, so the deploy job and the app's own docs can refer to them.
+The rendered pool carries one `email_configuration` block that switches on two variables,
+declared in `auth.tf` as below. The names are part of the pack's contract, so the deploy job and
+the app's own docs can refer to them.
 
 ```hcl
 variable "cognito_email_from" {
@@ -231,47 +161,14 @@ safeguarding checks on message content, belongs only to apps Albitor itself host
 a separate lane, and not the one that delivers an app into a customer's account. This
 is decided; the per-deployment question is *which* domain, never whose.
 
-## No dev/CI bypass — deliberately
+## Never add a bypass
 
-Earlier versions of this pack documented a var-gated `pre_sign_up` auto-confirm
-Lambda (`auth_dev_auto_confirm`) so the build could register a throwaway user with
-no emailed code. **It has been removed, and it must not be reintroduced.**
+Earlier versions of this pack documented a var-gated `pre_sign_up` auto-confirm Lambda. **It was
+removed and must not come back.** A trigger that confirms the harness's user confirms every
+visitor's: with self-sign-up on, anyone could mint a confirmed account with `email_verified: true`
+for an address they do not control. So the app's Terraform carries none of:
 
-The affordance was legitimate; its location was not. Albitor's loop needs to confirm
-*one throwaway user*; it does not follow that the **shipped user pool** should carry
-a trigger that confirms *everybody*. With self-sign-up on by default and the pool's
-`account_recovery_setting` trusting `verified_email`, an auto-confirm trigger lets
-anyone on the internet mint a `CONFIRMED` account with `email_verified: true` for an
-address they do not control — identity forgery, in the one environment the app is
-actually delivered in. It also removes the honest failure mode: with the trigger a
-bogus sign-up fails *open*, without it a sign-up with no reachable email path simply
-fails *closed*.
-
-So do not add any of the following to the app's Terraform:
-
-- a `variable "auth_dev_auto_confirm"` (or any similarly named flag);
-- a `lambda_config` / `dynamic "lambda_config"` block on `aws_cognito_user_pool.app`;
-- a `pre_sign_up` (or `pre_authentication`) trigger, count-gated or otherwise;
-- a `lambda-src/auto-confirm` module, its `archive_file`, IAM role, log group, invoke
-  permission, or CI build step.
-
-The test harness confirms its own user instead, from outside the app, using
-credentials CI already holds — `references/verification.md` has the exact steps. The
-only thing the app's Terraform has to provide for that is the
-`cognito_user_pool_id` output, which it already does (below).
-
-## Outputs the app needs
-
-These are **public** values — safe to expose to the browser as build-time config. There is no secret to protect.
-
-```hcl
-output "cognito_user_pool_id" { value = aws_cognito_user_pool.app.id }
-output "cognito_app_client_id" { value = aws_cognito_user_pool_client.spa.id }
-output "cognito_region" { value = var.aws_region }
-# Issuer/JWKS the API middleware verifies against:
-output "cognito_issuer" {
-  value = "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.app.id}"
-}
-```
-
-The API validates tokens against `${issuer}/.well-known/jwks.json` — see `references/api.md`.
+- an `auth_dev_auto_confirm` variable, or any similar flag;
+- a `lambda_config` block on the pool, dynamic or otherwise;
+- a `pre_sign_up` or `pre_authentication` trigger, count-gated or otherwise;
+- a user-pool admin action (`cognito-idp:Admin*`) on the API's role.

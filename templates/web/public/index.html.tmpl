@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Web App</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/auth.css" />
+  </head>
+  <body>
+    <!--
+      The sign-in screens were rendered by the cognito-auth pack. auth.js shows
+      the screen the route names (/sign-in, /sign-up, /confirm, /reset), and
+      anywhere else shows the app once GET /api/me says who is signed in. The
+      data-testid values are what tests/auth.setup.ts and the journey specs
+      target: keep them when restyling the screens.
+    -->
+    <main class="container auth-screen" data-testid="sign-in-screen" hidden>
+      <h1>Sign in</h1>
+      <form class="auth-form" data-testid="sign-in-form" novalidate>
+        <p class="auth-error" data-testid="sign-in-error" role="alert" hidden></p>
+        <label for="sign-in-email">Email address</label>
+        <input id="sign-in-email" name="email" type="email" autocomplete="username" required data-testid="sign-in-email" />
+        <label for="sign-in-password">Password</label>
+        <input id="sign-in-password" name="password" type="password" autocomplete="current-password" required data-testid="sign-in-password" />
+        <button type="submit" data-testid="sign-in-button">Sign in</button>
+      </form>
+      <p><a href="/reset" data-testid="sign-in-to-reset">Forgotten your password?</a></p>
+      <p>Don't have an account? <a href="/sign-up" data-testid="sign-in-to-sign-up">Sign up</a></p>
+    </main>
+
+    <main class="container auth-screen" data-testid="sign-up-screen" hidden>
+      <h1>Create an account</h1>
+      <form class="auth-form" data-testid="sign-up-form" novalidate>
+        <p class="auth-error" data-testid="sign-up-error" role="alert" hidden></p>
+        <label for="sign-up-email">Email address</label>
+        <input id="sign-up-email" name="email" type="email" autocomplete="email" required data-testid="sign-up-email" />
+        <label for="sign-up-password">Password</label>
+        <p class="auth-hint" id="sign-up-password-hint">
+          At least 12 characters, with upper and lower case letters and a number.
+        </p>
+        <input
+          id="sign-up-password"
+          name="password"
+          type="password"
+          autocomplete="new-password"
+          aria-describedby="sign-up-password-hint"
+          required
+          data-testid="sign-up-password"
+        />
+        <button type="submit" data-testid="sign-up-button">Create account</button>
+      </form>
+      <p>Already have an account? <a href="/sign-in" data-testid="sign-up-to-sign-in">Sign in</a></p>
+    </main>
+
+    <main class="container auth-screen" data-testid="confirm-screen" hidden>
+      <h1>Confirm your email address</h1>
+      <p>We have emailed you a code. Enter it here to finish creating your account.</p>
+      <form class="auth-form" data-testid="confirm-form" novalidate>
+        <p class="auth-error" data-testid="confirm-error" role="alert" hidden></p>
+        <p class="auth-status" data-testid="confirm-status" role="status" hidden></p>
+        <label for="confirm-email">Email address</label>
+        <input id="confirm-email" name="email" type="email" autocomplete="email" required data-testid="confirm-email" />
+        <label for="confirm-code">Code</label>
+        <input id="confirm-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required data-testid="confirm-code" />
+        <button type="submit" data-testid="confirm-button">Confirm</button>
+      </form>
+      <p><button type="button" class="auth-link" data-testid="confirm-resend">Send a new code</button></p>
+      <p><a href="/sign-in" data-testid="confirm-to-sign-in">Back to sign in</a></p>
+    </main>
+
+    <main class="container auth-screen" data-testid="reset-screen" hidden>
+      <h1>Reset your password</h1>
+      <form class="auth-form" data-testid="reset-request-form" novalidate>
+        <p class="auth-error" data-testid="reset-request-error" role="alert" hidden></p>
+        <label for="reset-email">Email address</label>
+        <input id="reset-email" name="email" type="email" autocomplete="email" required data-testid="reset-email" />
+        <button type="submit" data-testid="reset-request-button">Email me a code</button>
+      </form>
+      <form class="auth-form" data-testid="reset-form" novalidate hidden>
+        <p class="auth-status" role="status">If that address has an account, we have emailed it a code.</p>
+        <p class="auth-error" data-testid="reset-error" role="alert" hidden></p>
+        <label for="reset-code">Code</label>
+        <input id="reset-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required data-testid="reset-code" />
+        <label for="reset-password">New password</label>
+        <p class="auth-hint" id="reset-password-hint">
+          At least 12 characters, with upper and lower case letters and a number.
+        </p>
+        <input
+          id="reset-password"
+          name="password"
+          type="password"
+          autocomplete="new-password"
+          aria-describedby="reset-password-hint"
+          required
+          data-testid="reset-password"
+        />
+        <button type="submit" data-testid="reset-button">Set new password</button>
+      </form>
+      <p><a href="/sign-in" data-testid="reset-to-sign-in">Back to sign in</a></p>
+    </main>
+
+    <main class="container" data-testid="app-root" hidden>
+      <header class="header">
+        <h1 data-testid="app-title">Web App</h1>
+        <span class="badge" data-testid="health-badge" aria-live="polite">…</span>
+        <span class="signed-in">
+          <span data-testid="signed-in-as"></span>
+          <button type="button" class="auth-link" data-testid="sign-out-button" hidden>Sign out</button>
+        </span>
+      </header>
+
+      <form class="add-form" data-testid="add-item-form">
+        <label class="visually-hidden" for="item-title-input">Item title</label>
+        <input
+          id="item-title-input"
+          type="text"
+          name="title"
+          placeholder="New item title"
+          autocomplete="off"
+          data-testid="item-title-input"
+        />
+        <button type="submit" data-testid="add-item-button">Add item</button>
+      </form>
+
+      <section>
+        <ul class="items" data-testid="items-list"></ul>
+        <p class="empty" data-testid="items-empty" hidden>No items yet</p>
+      </section>
+    </main>
+
+    <!-- auth.js loads app.js once the visitor is signed in. -->
+    <script src="/auth.js"></script>
+  </body>
+</html>
