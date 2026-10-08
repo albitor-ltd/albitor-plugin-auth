@@ -1,0 +1,303 @@
+import { type Dirent, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { expect, type Locator, test as setup } from "@playwright/test";
+import {
+  DEMO_STORAGE_STATE,
+  EMPTY_STORAGE_STATE,
+  hasDemoSession,
+  WEB_ROOT,
+} from "./helpers/storage-state";
+
+// ONE SIGN-IN FOR THE WHOLE SUITE.
+//
+// This runs once, before every other project, signs in as the app's seeded demo
+// account and saves the session to disk. playwright.config.ts then loads that
+// session into every browser context, so no other spec signs in and no other
+// spec signs up.
+//
+// WHY NO OTHER SPEC MAY REGISTER. Every sign-up through a Cognito user pool sends
+// one confirmation email, and the default Cognito sender is capped at 50 a day
+// PER AWS ACCOUNT — shared by every app deployed into that account, not budgeted
+// per app. Three apps whose suites each registered a fresh account per run
+// exhausted the whole account's allowance in an afternoon; from then on every
+// sign-up in every app in that account failed, and suites went red for want of a
+// session rather than for want of a feature. A seeded account signed into once
+// spends none of it.
+//
+// THE ONE EXCEPTION is the spec that tests signing in or registering, which must
+// start signed out. It opts out at the top of its own file:
+//
+//   test.use({ storageState: EMPTY_STORAGE_STATE });
+//
+// and it is the only file in this suite that may touch registration.
+//
+// NO CREDENTIALS, NO SIGN-IN, STILL GREEN. An app with no authentication — and
+// this template as delivered — sets no password, so the block below writes a
+// signed-out session and the suite runs as an anonymous visitor. That is a
+// deliberate no-op rather than a failure: a template that cannot run its own
+// tests teaches nothing. The same holds for an app that has a password but no
+// sign-in screen yet; see SIGN_IN_SCREEN_EXISTS below.
+//
+// A SPEC THAT NEEDS A SESSION SAYS SO, and then skips rather than fails when
+// the suite is running signed out:
+//
+//   import { hasDemoSession } from "./helpers/storage-state";
+//   test.beforeEach(() => {
+//     test.skip(!hasDemoSession(), "no signed-in session: this app has no sign-in yet");
+//   });
+//
+// It has to be a beforeEach (or the first line of the test), not a top-level
+// test.skip: the session file is written by this setup, which runs after every
+// spec file has been loaded.
+
+// TWO ROUTES IN, AND THE FILE WINS.
+//
+// An automated walk of this app's journeys writes a JSON file, mode 0600, named
+// by ALBITOR_JOURNEY_CREDENTIALS and deleted when the walk ends, holding
+// { "username", "password", "sign_in_route" }. A file has a lifetime and an
+// owner; an environment is handed to every browser process the run spawns and
+// printed by any step that dumps it. Outside a walk the same three values come
+// from the environment, and the password is never in this repository at all — it
+// is provisioned into this app's own parameter store and reaches the run from
+// outside the checkout.
+//
+// Neither being present is the ordinary case for this template and for any app
+// with no sign-in, and the reading is deliberately forgiving: an unreadable or
+// unexpected file falls through to the environment and then to a signed-out
+// session. A suite that cannot start says nothing about the app; a suite that
+// runs signed out says exactly which screens need a session.
+type DemoCredentials = {
+  username: string;
+  password: string;
+  signInRoute: string;
+};
+
+function readCredentials(): DemoCredentials {
+  const fromEnv: DemoCredentials = {
+    // The app's own seeded demo user: the account its owner signs in with, and
+    // the one the app's screens are photographed through. Photographing another
+    // account's view would photograph a screen the owner never sees.
+    username: process.env.DEMO_ACCOUNT_USERNAME || "demo@albitor-demo.invalid",
+    password: process.env.ALBITOR_DEMO_ACCOUNT_PASSWORD || "",
+    signInRoute: process.env.DEMO_ACCOUNT_SIGN_IN_ROUTE || "/sign-in",
+  };
+
+  const credentialsPath = process.env.ALBITOR_JOURNEY_CREDENTIALS || "";
+  if (!credentialsPath) {
+    return fromEnv;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(credentialsPath, "utf8")) as {
+      username?: string;
+      password?: string;
+      sign_in_route?: string;
+    };
+    if (!parsed.password) {
+      return fromEnv;
+    }
+    return {
+      username: parsed.username || fromEnv.username,
+      password: parsed.password,
+      signInRoute: parsed.sign_in_route || fromEnv.signInRoute,
+    };
+  } catch {
+    return fromEnv;
+  }
+}
+
+const { username, password, signInRoute } = readCredentials();
+
+// DOES THIS APP HAVE A SIGN-IN SCREEN YET? Set this to true in the change that
+// builds it.
+//
+// A password can exist before the screen does. The demo account is seeded as
+// soon as the user pool is applied, which can be several changes before any
+// screen lets a person sign in to it. Until the screen exists there is nothing
+// to sign in through, and failing here would fail every deploy for a feature
+// nobody has built yet. So while this is false the setup looks for the screen
+// first: found, it signs in exactly as below; not found, it runs the suite
+// signed out, and every spec that needs a session skips itself (see
+// hasDemoSession in ./helpers/storage-state.ts).
+//
+// The flag is what keeps that lenience from outliving its reason. Once it is
+// true the setup no longer looks first: it signs in, a sign-in screen that has
+// gone missing fails the run, and so does a deployed run with no password to
+// sign in with. Neither can then skip every signed-in spec, green.
+//
+// FORGETTING TO SET IT FAILS TOO. While it is false, the setup fails rather than
+// running signed out if the app's own front end anywhere under web/ names the
+// sign-in field's test id, or if the sign-in route shows a password field or any
+// "sign-in" test id other than the one it looked for. Either means a sign-in
+// screen exists and this flag, or the test ids below, were not updated.
+//
+// TRUE FROM THE FIRST COMMIT: the cognito-auth pack rendered the sign-in screen
+// (web/public/index.html and auth.js, at /sign-in) with the repository, so a
+// missing screen or a missing password on a deployed run is a failure here.
+const SIGN_IN_SCREEN_EXISTS = true;
+
+// The test id the setup types the username into, and looks for.
+const SIGN_IN_EMAIL_ID = "sign-in-email";
+
+// How long the setup looks for the sign-in screen before deciding there is none.
+// Generous on purpose: it is paid once per run, and only by an app with no
+// screen, while a cold edge that answers slowly must not be mistaken for one.
+const SIGN_IN_PROBE_MS = 10_000;
+
+// Whether this run browses a DEPLOYED app: the deploy's pre-ship verify, or an
+// automated journey walk. An ordinary local or CI run boots its own stack,
+// which has no user pool to sign in to, so a missing password there is the
+// ordinary case. Against a deployed app with a sign-in screen it is a failed
+// lookup — and quietly running signed out would hide it.
+const browsesDeployedApp = !!(
+  (process.env.PLAYWRIGHT_API_ORIGIN || "").trim() ||
+  (process.env.ALBITOR_JOURNEY_BASE_URL || "").trim()
+);
+
+// signInScreenAppears reports whether the sign-in field shows up within the
+// probe window. Only "it never appeared" is a no; anything else — the browser
+// crashed, the page closed — is a real failure and is thrown as one.
+async function signInScreenAppears(field: Locator): Promise<boolean> {
+  try {
+    await field.waitFor({ state: "visible", timeout: SIGN_IN_PROBE_MS });
+    return true;
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      return false;
+    }
+    throw err;
+  }
+}
+
+// Directories under web/ the source scan never enters: dependencies, this test
+// suite (which names the test id itself), and build and report output.
+const SCAN_SKIP_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  ".svelte-kit",
+  ".next",
+  ".nuxt",
+  ".output",
+  "playwright-report",
+  "test-results",
+]);
+
+// A file larger than this is a bundle or an asset, not a screen's source.
+const SCAN_MAX_BYTES = 2 * 1024 * 1024;
+
+// sourceNamingSignInField returns the first file of the app's own front end that
+// names the sign-in field's test id, or "" when none does.
+//
+// IT SCANS ALL OF web/, not one conventional directory. This template's front
+// end is web/public/index.html and app.js, with no web/src at all; a framework
+// swap puts it in web/src, web/app or web/pages. A scan of one of those would
+// pass silently over the others. Symbolic links are not followed, and an
+// unreadable entry is skipped rather than failing the scan.
+function sourceNamingSignInField(): string {
+  const pending = [WEB_ROOT];
+  while (pending.length > 0) {
+    const dir = pending.pop() as string;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const topLevelTests = dir === WEB_ROOT && entry.name === "tests";
+        if (!topLevelTests && !SCAN_SKIP_DIRS.has(entry.name)) {
+          pending.push(path);
+        }
+        continue;
+      }
+      // A symlink, broken or not, is neither a file nor a directory here.
+      if (!entry.isFile()) {
+        continue;
+      }
+      try {
+        if (statSync(path).size <= SCAN_MAX_BYTES && readFileSync(path, "utf8").includes(SIGN_IN_EMAIL_ID)) {
+          return join("web", relative(WEB_ROOT, path));
+        }
+      } catch {
+        // Unreadable: skip it.
+      }
+    }
+  }
+  return "";
+}
+
+// runSignedOut saves the signed-out session and says so twice: as an annotation
+// on this test, which the report shows, and as a log line an automated walk
+// quotes when a journey skips for want of a session.
+function runSignedOut(why: string): void {
+  setup.info().annotations.push({ type: "signed-out", description: why });
+  console.log(`auth.setup: ${why}, so the suite runs signed out and specs that need a session skip themselves`);
+  writeFileSync(DEMO_STORAGE_STATE, JSON.stringify(EMPTY_STORAGE_STATE));
+}
+
+setup("sign in once as the demo account", async ({ page }) => {
+  mkdirSync(dirname(DEMO_STORAGE_STATE), { recursive: true });
+
+  if (!SIGN_IN_SCREEN_EXISTS) {
+    const naming = sourceNamingSignInField();
+    if (naming) {
+      throw new Error(
+        `${naming} renders the sign-in field (test id "${SIGN_IN_EMAIL_ID}") but SIGN_IN_SCREEN_EXISTS ` +
+          "is false: set it to true in tests/auth.setup.ts so a broken sign-in fails instead of skipping",
+      );
+    }
+  }
+
+  if (!password) {
+    if (SIGN_IN_SCREEN_EXISTS && browsesDeployedApp) {
+      throw new Error(
+        "no demo account password reached this run, and SIGN_IN_SCREEN_EXISTS says the app has a " +
+          "sign-in screen: the password lookup failed, so the signed-in specs would all skip",
+      );
+    }
+    runSignedOut("no demo account password");
+    return;
+  }
+
+  // THIS APP'S SIGN-IN SCREEN. Adjust the three test ids to whatever this app
+  // actually renders — that, declaring the route, and setting
+  // SIGN_IN_SCREEN_EXISTS above are the whole of what changes here when the app
+  // grows authentication. Everything above and below stays as it is.
+  await page.goto(signInRoute);
+  const emailField = page.getByTestId(SIGN_IN_EMAIL_ID);
+
+  if (!SIGN_IN_SCREEN_EXISTS && !(await signInScreenAppears(emailField))) {
+    // Something sign-in shaped IS on the page: the screen exists under other
+    // test ids. Running signed out would hide that.
+    if ((await page.locator('input[type="password"], [data-testid^="sign-in"]').count()) > 0) {
+      throw new Error(
+        `${signInRoute} shows a password field or a "sign-in" test id but no "${SIGN_IN_EMAIL_ID}": ` +
+          "update the test ids in tests/auth.setup.ts to this app's sign-in screen and set SIGN_IN_SCREEN_EXISTS",
+      );
+    }
+    runSignedOut(`no sign-in screen at ${signInRoute} yet`);
+    return;
+  }
+
+  await emailField.fill(username);
+  await page.getByTestId("sign-in-password").fill(password);
+  await page.getByTestId("sign-in-button").click();
+
+  // Prove the sign-in worked before saving it. A saved session that is not a
+  // session turns every later spec red on its first assertion, one screen away
+  // from the thing that actually broke.
+  await expect(page.getByTestId("sign-in-form")).toBeHidden();
+
+  await page.context().storageState({ path: DEMO_STORAGE_STATE });
+
+  // And prove the saved session holds something. An app that keeps its session
+  // in sessionStorage or in memory signs in fine and saves an empty state, and
+  // every spec guarding on hasDemoSession() would then skip, green.
+  expect(
+    hasDemoSession(),
+    "the sign-in succeeded but saved no cookies or local storage; keep the session in a cookie or localStorage so the suite can reuse it",
+  ).toBe(true);
+});

@@ -1,0 +1,39 @@
+import { expect, test } from "@playwright/test";
+import { EMPTY_STORAGE_STATE } from "./helpers/storage-state";
+
+// The sign-in screens the cognito-auth pack rendered: each renders at its route
+// with the test ids tests/auth.setup.ts and the journey specs target, and a
+// first-time visitor can get from sign-in to sign-up and back without typing a
+// URL.
+//
+// It runs signed out, and it never submits a form: a sign-up sends a
+// confirmation email, and the pool's default sender allows 50 a day for the
+// whole AWS account (see tests/auth.setup.ts).
+test.use({ storageState: EMPTY_STORAGE_STATE });
+
+test("the sign-in screen renders and links to sign-up and reset", async ({ page }) => {
+  await page.goto("/sign-in");
+  await expect(page.getByTestId("sign-in-form")).toBeVisible();
+  await expect(page.getByTestId("sign-in-email")).toBeEditable();
+  await expect(page.getByTestId("sign-in-password")).toBeEditable();
+  await expect(page.getByTestId("sign-in-button")).toBeEnabled();
+  await expect(page.getByTestId("app-root")).toBeHidden();
+
+  await page.getByTestId("sign-in-to-sign-up").click();
+  await expect(page).toHaveURL(/\/sign-up$/);
+  await expect(page.getByTestId("sign-up-form")).toBeVisible();
+
+  await page.getByTestId("sign-up-to-sign-in").click();
+  await expect(page.getByTestId("sign-in-form")).toBeVisible();
+
+  await page.getByTestId("sign-in-to-reset").click();
+  await expect(page.getByTestId("reset-request-form")).toBeVisible();
+});
+
+test("the confirm-code screen takes the address it was sent to", async ({ page }) => {
+  await page.goto("/confirm?email=someone%40example.invalid");
+  await expect(page.getByTestId("confirm-form")).toBeVisible();
+  await expect(page.getByTestId("confirm-email")).toHaveValue("someone@example.invalid");
+  await expect(page.getByTestId("confirm-code")).toBeEditable();
+  await expect(page.getByTestId("confirm-resend")).toBeEnabled();
+});

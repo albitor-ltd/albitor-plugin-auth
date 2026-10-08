@@ -1,0 +1,488 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+)
+
+// The Cognito half of sign-in: where the pool comes from, the sign-in calls the
+// web app makes (POST /api/auth/*), and the session cookies.
+//
+// WHY THE API MAKES THE SIGN-IN CALLS, NOT THE BROWSER. The page's
+// Content-Security-Policy allows connections to its own origin only
+// (connect-src 'self'), and the web app is served as static files with no
+// build step to carry the pool's ids. So the browser posts to /api/auth/*, and
+// the API calls Cognito's public, unauthenticated operations on its behalf.
+// The tokens come back as HttpOnly cookies the page's JavaScript cannot read,
+// which is the hardened shape anyway: no token in localStorage for an injected
+// script to steal.
+
+// Environment variables that name the pool directly. Optional: a deployed
+// function reads the auth config parameter infrastructure/aws/auth.tf writes.
+const (
+	AuthUserPoolIDEnv = "AUTH_USER_POOL_ID"
+	AuthClientIDEnv   = "AUTH_CLIENT_ID"
+	awsRegionEnv      = "AWS_REGION"
+	lambdaNameEnv     = "AWS_LAMBDA_FUNCTION_NAME"
+)
+
+// The session cookies. Both HttpOnly, Secure and SameSite=Strict: no script
+// reads them and no other site's form sends them.
+const (
+	sessionCookie = "session"
+	refreshCookie = "session_refresh"
+	// refreshCookiePath keeps the refresh token off every request but the
+	// API's: the gate refreshes an expired session on any /api/ call.
+	refreshCookiePath = "/api"
+	// sessionMaxAge matches the client's refresh-token validity (auth.tf).
+	sessionMaxAge = 30 * 24 * time.Hour
+)
+
+const (
+	maxAuthBodyBytes = 16 << 10
+	cognitoTimeout   = 10 * time.Second
+)
+
+// authConfig names the pool and client the API trusts.
+type authConfig struct {
+	Region     string `json:"region"`
+	UserPoolID string `json:"user_pool_id"`
+	ClientID   string `json:"client_id"`
+}
+
+func (c authConfig) valid() bool {
+	return isSafeToken(c.Region, 32) && isSafeToken(c.UserPoolID, 128) && isSafeToken(c.ClientID, 128)
+}
+
+func (c authConfig) issuer() string {
+	return "https://cognito-idp." + c.Region + ".amazonaws.com/" + c.UserPoolID
+}
+
+func (c authConfig) endpoint() string {
+	return "https://cognito-idp." + c.Region + ".amazonaws.com/"
+}
+
+// authSource loads the pool once, on first use, and keeps it. A failed load is
+// not kept: the next request tries again, so a cold start that raced the
+// parameter's creation recovers on its own.
+type authSource struct {
+	load func(ctx context.Context) (*cognitoAuth, error)
+
+	mu   sync.Mutex
+	auth *cognitoAuth
+}
+
+func (s *authSource) get(ctx context.Context) (*cognitoAuth, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.auth != nil {
+		return s.auth, nil
+	}
+	a, err := s.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.auth = a
+	return a, nil
+}
+
+// authSourceFromEnv decides where the pool comes from:
+//
+//   - AUTH_USER_POOL_ID and AUTH_CLIENT_ID set (with AWS_REGION): those.
+//   - a deployed function: the parameter /<function name>/auth/config, which
+//     infrastructure/aws/auth.tf writes and lets this function read.
+//   - neither (ALBITOR_LOCAL=1, or a unit test): nil, and the gate lets every
+//     request through as AnonymousOwner. A deployed function never gets here:
+//     the Lambda runtime sets AWS_LAMBDA_FUNCTION_NAME itself.
+func authSourceFromEnv(getenv func(string) string) *authSource {
+	pool := strings.TrimSpace(getenv(AuthUserPoolIDEnv))
+	client := strings.TrimSpace(getenv(AuthClientIDEnv))
+	if pool != "" || client != "" {
+		cfg := authConfig{Region: strings.TrimSpace(getenv(awsRegionEnv)), UserPoolID: pool, ClientID: client}
+		return &authSource{load: func(context.Context) (*cognitoAuth, error) {
+			if !cfg.valid() {
+				return nil, fmt.Errorf("%s, %s and %s must all be set", AuthUserPoolIDEnv, AuthClientIDEnv, awsRegionEnv)
+			}
+			return newCognitoAuth(cfg), nil
+		}}
+	}
+	fn := strings.TrimSpace(getenv(lambdaNameEnv))
+	if fn == "" {
+		return nil
+	}
+	name := "/" + fn + "/auth/config"
+	return &authSource{load: func(ctx context.Context) (*cognitoAuth, error) {
+		cfg, err := config.LoadDefaultConfig(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("load AWS config: %w", err)
+		}
+		reader := ssmParameterReader{client: ssm.NewFromConfig(cfg)}
+		readCtx, cancel := context.WithTimeout(ctx, SecretReadTimeout)
+		defer cancel()
+		raw, err := reader.ReadParameter(readCtx, name)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		var ac authConfig
+		if err := json.Unmarshal([]byte(raw), &ac); err != nil || !ac.valid() {
+			return nil, fmt.Errorf("%s does not name a region, pool and client", name)
+		}
+		return newCognitoAuth(ac), nil
+	}}
+}
+
+// cognitoAuth is one pool and client: the token check and the public calls.
+type cognitoAuth struct {
+	clientID string
+	endpoint string
+	client   *http.Client
+	verifier *tokenVerifier
+}
+
+func newCognitoAuth(cfg authConfig) *cognitoAuth {
+	client := &http.Client{Timeout: cognitoTimeout}
+	return &cognitoAuth{
+		clientID: cfg.ClientID,
+		endpoint: cfg.endpoint(),
+		client:   client,
+		verifier: newTokenVerifier(cfg.issuer(), cfg.ClientID, cfg.issuer()+"/.well-known/jwks.json", client),
+	}
+}
+
+// authenticate returns the verified identity a request carries — from its
+// bearer token, or from the session cookie, refreshing an expired session from
+// the refresh cookie. On a refusal it has already written the response.
+func (a *cognitoAuth) authenticate(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (Identity, bool) {
+	raw, fromCookie := requestToken(r)
+	if raw == "" {
+		writeUnauthenticated(w)
+		return Identity{}, false
+	}
+	id, err := a.verifier.verify(r.Context(), raw)
+	if errors.Is(err, errTokenExpired) && fromCookie {
+		id, err = a.refreshSession(w, r)
+	}
+	switch {
+	case err == nil:
+		return id, true
+	case errors.Is(err, errVerifierUnavailable):
+		logger.ErrorContext(r.Context(), "could not check a sign-in token",
+			slog.String("correlation_id", CorrelationIDFromContext(r.Context())),
+			slog.String("error", err.Error()))
+		writeError(w, http.StatusServiceUnavailable, "sign-in is unavailable")
+		return Identity{}, false
+	default:
+		if fromCookie {
+			clearSessionCookies(w)
+		}
+		writeUnauthenticated(w)
+		return Identity{}, false
+	}
+}
+
+func writeUnauthenticated(w http.ResponseWriter) {
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "sign-in required", "code": "unauthenticated"})
+}
+
+// requestToken returns the request's token and whether it came from the
+// session cookie. A bearer header wins.
+func requestToken(r *http.Request) (string, bool) {
+	if h := r.Header.Get("Authorization"); h != "" {
+		if token, ok := strings.CutPrefix(h, "Bearer "); ok {
+			return strings.TrimSpace(token), false
+		}
+		return "", false
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		return c.Value, true
+	}
+	return "", false
+}
+
+// refreshSession swaps the refresh cookie for a new session.
+func (a *cognitoAuth) refreshSession(w http.ResponseWriter, r *http.Request) (Identity, error) {
+	c, err := r.Cookie(refreshCookie)
+	if err != nil || c.Value == "" {
+		return Identity{}, errTokenInvalid
+	}
+	tokens, cerr := a.initiateAuth(r.Context(), "REFRESH_TOKEN_AUTH", map[string]string{"REFRESH_TOKEN": c.Value})
+	if cerr != nil {
+		if cerr.kind == "" {
+			return Identity{}, fmt.Errorf("%w: %w", errVerifierUnavailable, cerr)
+		}
+		return Identity{}, errTokenInvalid
+	}
+	id, err := a.verifier.verify(r.Context(), tokens.IDToken)
+	if err != nil {
+		return Identity{}, err
+	}
+	setCookie(w, sessionCookie, tokens.IDToken, "/", sessionMaxAge)
+	return id, nil
+}
+
+func setCookie(w http.ResponseWriter, name, value, path string, maxAge time.Duration) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     path,
+		MaxAge:   int(maxAge.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func clearSessionCookies(w http.ResponseWriter) {
+	setCookie(w, sessionCookie, "", "/", -time.Second)
+	setCookie(w, refreshCookie, "", refreshCookiePath, -time.Second)
+}
+
+// serveAuth answers POST /api/auth/<action>: the calls the sign-in, sign-up,
+// confirm-code and reset screens make. Each takes a small JSON body.
+func (a *cognitoAuth) serveAuth(w http.ResponseWriter, r *http.Request, logger *slog.Logger) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	// JSON only. Another site's HTML form cannot send this content type
+	// without the browser asking first, so it cannot sign a visitor in to an
+	// account of its choosing.
+	if mt, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";"); !strings.EqualFold(strings.TrimSpace(mt), "application/json") {
+		writeAuthError(w, http.StatusUnsupportedMediaType, "invalid_input", "send application/json")
+		return
+	}
+	var body struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxAuthBodyBytes)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeAuthError(w, http.StatusBadRequest, "invalid_input", "invalid json")
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	code := strings.TrimSpace(body.Code)
+
+	action := strings.TrimPrefix(r.URL.Path, authPathRoot)
+	if action != "sign-out" && email == "" {
+		writeAuthError(w, http.StatusBadRequest, "invalid_input", "email is required")
+		return
+	}
+
+	var cerr *cognitoError
+	switch action {
+	case "sign-in":
+		var tokens authTokens
+		tokens, cerr = a.initiateAuth(r.Context(), "USER_PASSWORD_AUTH", map[string]string{"USERNAME": email, "PASSWORD": body.Password})
+		if cerr == nil {
+			a.finishSignIn(w, r, tokens, logger)
+			return
+		}
+	case "sign-up":
+		var out struct {
+			UserConfirmed bool `json:"UserConfirmed"`
+		}
+		cerr = a.call(r.Context(), "SignUp", map[string]any{
+			"ClientId": a.clientID, "Username": email, "Password": body.Password,
+			"UserAttributes": []map[string]string{{"Name": "email", "Value": email}},
+		}, &out)
+		if cerr == nil {
+			writeJSON(w, http.StatusCreated, map[string]bool{"confirmation_required": !out.UserConfirmed})
+			return
+		}
+	case "confirm":
+		cerr = a.call(r.Context(), "ConfirmSignUp", map[string]any{
+			"ClientId": a.clientID, "Username": email, "ConfirmationCode": code,
+		}, nil)
+	case "resend":
+		cerr = a.call(r.Context(), "ResendConfirmationCode", map[string]any{"ClientId": a.clientID, "Username": email}, nil)
+	case "forgot":
+		cerr = a.call(r.Context(), "ForgotPassword", map[string]any{"ClientId": a.clientID, "Username": email}, nil)
+	case "reset":
+		cerr = a.call(r.Context(), "ConfirmForgotPassword", map[string]any{
+			"ClientId": a.clientID, "Username": email, "ConfirmationCode": code, "Password": body.Password,
+		}, nil)
+	case "sign-out":
+		a.signOut(w, r)
+		return
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if cerr != nil {
+		a.writeCognitoError(w, r, logger, action, cerr)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// finishSignIn checks the new ID token like any other and sets the session.
+func (a *cognitoAuth) finishSignIn(w http.ResponseWriter, r *http.Request, tokens authTokens, logger *slog.Logger) {
+	id, err := a.verifier.verify(r.Context(), tokens.IDToken)
+	if err != nil {
+		logger.ErrorContext(r.Context(), "the pool issued a token this API does not accept",
+			slog.String("correlation_id", CorrelationIDFromContext(r.Context())),
+			slog.String("error", err.Error()))
+		writeAuthError(w, http.StatusBadGateway, "unavailable", "sign-in is unavailable")
+		return
+	}
+	setCookie(w, sessionCookie, tokens.IDToken, "/", sessionMaxAge)
+	if tokens.RefreshToken != "" {
+		setCookie(w, refreshCookie, tokens.RefreshToken, refreshCookiePath, sessionMaxAge)
+	}
+	writeJSON(w, http.StatusOK, id)
+}
+
+// signOut revokes the refresh token, best effort, and clears the session.
+func (a *cognitoAuth) signOut(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(refreshCookie); err == nil && c.Value != "" {
+		_ = a.call(r.Context(), "RevokeToken", map[string]any{"ClientId": a.clientID, "Token": c.Value}, nil)
+	}
+	clearSessionCookies(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type authTokens struct {
+	IDToken      string `json:"IdToken"`
+	AccessToken  string `json:"AccessToken"`
+	RefreshToken string `json:"RefreshToken"`
+}
+
+func (a *cognitoAuth) initiateAuth(ctx context.Context, flow string, params map[string]string) (authTokens, *cognitoError) {
+	var out struct {
+		ChallengeName        string     `json:"ChallengeName"`
+		AuthenticationResult authTokens `json:"AuthenticationResult"`
+	}
+	if cerr := a.call(ctx, "InitiateAuth", map[string]any{
+		"ClientId": a.clientID, "AuthFlow": flow, "AuthParameters": params,
+	}, &out); cerr != nil {
+		return authTokens{}, cerr
+	}
+	if out.ChallengeName != "" || out.AuthenticationResult.IDToken == "" {
+		// A challenge (a temporary password, MFA) needs a screen this template
+		// does not ship. Add it when the app turns either on.
+		return authTokens{}, &cognitoError{kind: "ChallengeRequired", message: out.ChallengeName}
+	}
+	return out.AuthenticationResult, nil
+}
+
+// cognitoError is a failed call. kind is Cognito's exception name, or empty
+// when the call never got an answer from Cognito.
+type cognitoError struct {
+	kind    string
+	message string
+	err     error
+}
+
+func (e *cognitoError) Error() string {
+	if e.kind == "" {
+		return fmt.Sprintf("cognito unreachable: %v", e.err)
+	}
+	return e.kind + ": " + e.message
+}
+
+func (e *cognitoError) Unwrap() error { return e.err }
+
+// call makes one of Cognito's public user-pool operations. They need no AWS
+// credentials: the app client id is the whole of the authority.
+func (a *cognitoAuth) call(ctx context.Context, op string, in any, out any) *cognitoError {
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return &cognitoError{err: err}
+	}
+	ctx, cancel := context.WithTimeout(ctx, cognitoTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return &cognitoError{err: err}
+	}
+	req.Header.Set("Content-Type", "application/x-amz-json-1.1")
+	req.Header.Set("X-Amz-Target", "AWSCognitoIdentityProviderService."+op)
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return &cognitoError{err: err}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return &cognitoError{err: err}
+	}
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Type    string `json:"__type"`
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(body, &e)
+		kind := e.Type
+		if i := strings.LastIndex(kind, "#"); i >= 0 {
+			kind = kind[i+1:]
+		}
+		if kind == "" {
+			return &cognitoError{err: fmt.Errorf("%s answered %d", op, resp.StatusCode)}
+		}
+		return &cognitoError{kind: kind, message: e.Message}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return &cognitoError{err: fmt.Errorf("decode %s: %w", op, err)}
+	}
+	return nil
+}
+
+// writeCognitoError turns Cognito's answer into one the screens can act on.
+// The code is stable; the message is safe to show.
+func (a *cognitoAuth) writeCognitoError(w http.ResponseWriter, r *http.Request, logger *slog.Logger, action string, e *cognitoError) {
+	switch e.kind {
+	case "NotAuthorizedException", "UserNotFoundException":
+		writeAuthError(w, http.StatusUnauthorized, "invalid_credentials", "incorrect email or password")
+	case "UserNotConfirmedException":
+		writeAuthError(w, http.StatusForbidden, "not_confirmed", "confirm your email address first")
+	case "UsernameExistsException", "AliasExistsException":
+		writeAuthError(w, http.StatusConflict, "exists", "an account with that email already exists")
+	case "InvalidPasswordException":
+		writeAuthError(w, http.StatusBadRequest, "invalid_password", passwordMessage(e.message))
+	case "CodeMismatchException":
+		writeAuthError(w, http.StatusBadRequest, "invalid_code", "that code is not right")
+	case "ExpiredCodeException":
+		writeAuthError(w, http.StatusBadRequest, "expired_code", "that code has expired: ask for a new one")
+	case "InvalidParameterException":
+		writeAuthError(w, http.StatusBadRequest, "invalid_input", "check the details and try again")
+	case "LimitExceededException", "TooManyRequestsException", "TooManyFailedAttemptsException", "CodeDeliveryFailureException":
+		writeAuthError(w, http.StatusTooManyRequests, "rate_limited", "too many attempts: wait a while and try again")
+	case "ChallengeRequired":
+		writeAuthError(w, http.StatusConflict, "challenge_unsupported", "this account needs a sign-in step the app does not have yet")
+	default:
+		logger.ErrorContext(r.Context(), "sign-in call failed",
+			slog.String("correlation_id", CorrelationIDFromContext(r.Context())),
+			slog.String("action", action),
+			slog.String("error", e.Error()))
+		writeAuthError(w, http.StatusBadGateway, "unavailable", "sign-in is unavailable: try again shortly")
+	}
+}
+
+// passwordMessage keeps Cognito's description of the policy a password missed,
+// which names the rule and nothing about the account.
+func passwordMessage(msg string) string {
+	if _, rule, ok := strings.Cut(msg, ": "); ok && rule != "" {
+		return "password does not meet the policy: " + rule
+	}
+	return "password does not meet the policy"
+}
+
+func writeAuthError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}

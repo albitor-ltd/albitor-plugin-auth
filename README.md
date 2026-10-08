@@ -6,21 +6,47 @@ It is one of the plugins Albitor makes available to its users, and the **default
 
 ## What's inside
 
+### Templates (rendered into a new app's first commit)
+
+`templates/manifest.json` describes the files this pack renders into a new BYOA `web_app`
+repository, beside the starter, when the repository is created (Albitor ADR-0088). The manifest
+names the capability (`auth-mechanism`), provider (`cognito`), skill (`cognito-auth`), archetype
+(`web_app`), lane (`byoa`), the starter auth-seam version it implements (`1`) and its machine
+sign-in (`password`). Templates are plain files: the platform substitutes only its own
+`{{albitor.<token>}}` tokens, and these templates use none.
+
+| Repository path | What it is |
+| --- | --- |
+| `infrastructure/aws/auth.tf` | User pool (email verification, 12-character password policy, no trigger, no MFA), public client (`ALLOW_USER_PASSWORD_AUTH`, `ALLOW_USER_SRP_AUTH`, `ALLOW_REFRESH_TOKEN_AUTH`), the API's auth config parameter, and the `auth_user_pool_id` / `auth_client_id` outputs |
+| `api/server/identity.go`, `auth_token.go`, `auth_cognito.go`, `identity_test.go` | The API identity seam: JWKS-verified tokens, `/api/*` refused without one except `/api/health`, `GET /api/me`, `sub` as the record owner, and `POST /api/auth/*` with HttpOnly session cookies |
+| `web/public/index.html`, `auth.js`, `auth.css` | Sign-in, sign-up, confirm-code and reset screens with stable `data-testid`s |
+| `web/serve.mjs` | The local static server, serving the shell for route paths as CloudFront does |
+| `web/tests/auth.setup.ts`, `web/tests/auth-screens.spec.ts` | `SIGN_IN_SCREEN_EXISTS = true`, and a signed-out spec of the screens |
+| `scripts/seed-journey-fixtures.sh` | Journey fixtures seeded as the verifier and the demo account |
+
+Every pack version's rendered tree is gated at ingest by the platform's floor checks, so a build
+starts from a tree that passes. A build may then change any rendered file; the same gates run on
+what it ships.
+
 ### Skill (loads automatically when relevant)
 
 | Skill | Capability | Triggers on | Bundled references |
 | --- | --- | --- | --- |
-| `auth:cognito-auth` | `auth-mechanism` | Building or reviewing end-user authentication (sign-up + login) for a delivered app | Cognito Terraform (user pool + public app client), the in-app sign-up / login / confirm-code / resend screens, the JWT-validation API middleware + `GET /api/me`, and the skill-declared verification entry |
+| `auth:cognito-auth` | `auth-mechanism` | Building or reviewing end-user authentication (sign-up and sign-in) for a delivered app | Email sending and the no-bypass rule (`terraform.md`), and the skill-declared verification entry (`verification.md`) |
 
-The skill provides:
+The skill tells a build what is already in the repository and what it still writes:
+authorisation, profile fields, the screens' place and styling in the app, its copy, and anything
+the brief adds.
 
-- **Terraform** — a Cognito **user pool** + **public app client** (no secret), `USER_PASSWORD_AUTH` flow.
-- **In-app UI** — sign-up, login, confirm-code, and resend screens, styled by the app's chosen design system, **not** the Cognito Hosted UI.
-- **API** — JWT-validation middleware (JWKS signature + issuer/token-use/client/expiry checks) and a protected `GET /api/me`.
-- **Email verification required in every environment** — secure by default: sign-ups must confirm an emailed code, so the confirm-code/resend screens are on the happy path. There is **no auto-confirm override in the delivered app**; Albitor's own build/verify loop self-proves signup by confirming its own throwaway user through the Cognito admin API from the deploy job, so the shipped user pool is identical to a production one.
-- **No email path until the app's AWS account has one** — until that account holds a verified Amazon SES identity with SES production access, a real visitor's sign-up cannot complete: they sign up, reach the confirm-code screen, and no code arrives. It is no email path rather than a low-volume one, the sending domain is the customer's own verified in the customer's own account, and the fix is an onboarding step per account — the skill's `references/terraform.md` carries the `email_configuration` block and both failure modes.
-- **Optional SES-backed sending, two variables** — the pool's Terraform declares `cognito_email_from` and `cognito_email_ses_identity_arn`. Both empty keeps Cognito's default sender (50 emails a day per AWS account, shared by every app in it); both set switches the pool to `DEVELOPER` sending through that identity. Production apps set both, and document the identity as sending account, two-factor authentication and recovery mail only — no marketing.
-- **Self-sign-up on by default** — the done-criterion is *"a first-time visitor can self-register from the app."*
+- **Email verification is required in every environment.** There is no auto-confirm trigger in
+  the delivered pool, and the build proves sign-in with the per-deploy seeded verifier account
+  rather than by registering.
+- **No email path until the app's AWS account has one.** Until that account holds a verified
+  Amazon SES identity with production access, a real visitor's sign-up cannot complete. The pool
+  takes `cognito_email_from` and `cognito_email_ses_identity_arn`; both set switches it to
+  `DEVELOPER` sending through that identity. See `skills/cognito-auth/references/terraform.md`.
+- **Self-sign-up is on by default.** The done-criterion is *"a first-time visitor can
+  self-register from the app."*
 
 ### Capability contract
 
@@ -28,7 +54,7 @@ The skill's `SKILL.md` frontmatter declares `capability: auth-mechanism`, and th
 
 ### Preview
 
-`preview/index.html` is a self-contained, neutral **wireframe** of the four auth screens (sign-up, login, confirm-code, resend). It is a flow reference for scoping a build — **not** a style: the delivered app's screens are styled by its chosen design-system skill, so the wireframe deliberately uses a plain system-font layout and carries no design-system branding. It opens straight from `file://` with no build step.
+`preview/index.html` is a self-contained, neutral **wireframe** of the auth screens. It is a flow reference for scoping a build, not a style. It opens straight from `file://` with no build step.
 
 ## Installing
 
@@ -53,13 +79,13 @@ claude plugin validate /path/to/albitor-plugin-auth
 
 ## Keeping it current
 
-The skill's references are a distilled snapshot of how to wire Cognito, not a live mirror. The Terraform AWS provider and the AWS SDKs change, so the references always tell the assistant to confirm exact argument and command names against the live sources:
+The templates and references are a snapshot of how to wire Cognito, not a live mirror. The Terraform AWS provider and Cognito change; confirm argument and operation names against the live sources:
 
 - Amazon Cognito developer guide — <https://docs.aws.amazon.com/cognito/latest/developerguide/>
 - Terraform AWS provider (`aws_cognito_user_pool`, `aws_cognito_user_pool_client`) — <https://registry.terraform.io/providers/hashicorp/aws/latest/docs>
-- AWS SDK for JavaScript v3 (`@aws-sdk/client-cognito-identity-provider`) — <https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/>
+- Cognito user pools API reference — <https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/>
 
-To refresh the references, re-distil from those sources into `skills/cognito-auth/references/` and bump the `version` in `.claude-plugin/plugin.json`.
+Bump the `version` in `.claude-plugin/plugin.json` with any change to `templates/` or `skills/`: the platform pins a pack by version and content hash, and gates each version's templates once.
 
 ## Licensing
 

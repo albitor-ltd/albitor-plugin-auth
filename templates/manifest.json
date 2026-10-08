@@ -1,0 +1,25 @@
+{
+  "seam_version": 1,
+  "capability": "auth-mechanism",
+  "provider": "cognito",
+  "skill": "cognito-auth",
+  "archetype": "web_app",
+  "lanes": [
+    "byoa"
+  ],
+  "sign_in": "password",
+  "files": {
+    "infrastructure/aws/auth.tf": "infrastructure/auth.tf.tmpl",
+    "api/server/identity.go": "api/identity.go.tmpl",
+    "api/server/auth_token.go": "api/auth_token.go.tmpl",
+    "api/server/auth_cognito.go": "api/auth_cognito.go.tmpl",
+    "api/server/identity_test.go": "api/identity_test.go.tmpl",
+    "web/public/index.html": "web/public/index.html.tmpl",
+    "web/public/auth.js": "web/public/auth.js.tmpl",
+    "web/public/auth.css": "web/public/auth.css.tmpl",
+    "web/serve.mjs": "web/serve.mjs.tmpl",
+    "web/tests/auth.setup.ts": "web/tests/auth.setup.ts.tmpl",
+    "web/tests/auth-screens.spec.ts": "web/tests/auth-screens.spec.ts.tmpl",
+    "scripts/seed-journey-fixtures.sh": "scripts/seed-journey-fixtures.sh.tmpl"
+  }
+}

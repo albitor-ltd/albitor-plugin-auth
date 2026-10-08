@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+#
+# Seed this app's journey fixtures — once per deploy, from the deploy job, in
+# dev only, and never from the request-serving Lambda.
+#
+# WHAT A JOURNEY FIXTURE IS. Every user journey with screens carries an
+# end-to-end spec under web/tests/journeys/. Those specs are run against the
+# deployed app and each step is photographed, and the photographs are what the
+# app's owner is shown and asked to accept. A queue with no items in it is a
+# picture of a table header, so the fixtures below exist to put something real on
+# the screen before the walk starts. They are this app's own dev data: realistic,
+# plausible records for whatever this app is about.
+#
+# WHY IT IS HERE AND NOT IN THE APP. A seeder that runs at Lambda cold start, from
+# a request handler or from a warm-up puts a write path into the app's own store
+# behind the identity that answers anonymous internet traffic, with nothing in
+# front of it deciding whether this is the environment for it. It also runs
+# wherever the app runs. The deploy job is a place that already writes to this
+# app's infrastructure, and — because a commit reaches live only by promoting a
+# build that passed in dev — a step placed here runs in dev and nowhere else.
+# That placement is policed by a deterministic governance gate; it is not a
+# preference.
+#
+# DEV ONLY, FAIL-CLOSED. It seeds when the environment is exactly "dev". Anything
+# else, including an unset environment, seeds nothing. Live carries no fixtures at
+# all: nobody wants their production app opened for the first time on invented
+# records, and a gallery of a seeded production app would be a picture of
+# something the customer never asked for.
+#
+# NO NEW AUTHORITY. Every record is created through the app's OWN API, over the
+# same public edge a browser uses, so this script needs no IAM grant, no database
+# credential and no role of its own. It signs in as the two seeded accounts
+# (sign_in() below), which is the ONE place a credential enters.
+#
+# THESE RECORDS ARE THIS APP'S OWN. They are dev data belonging to this app, in
+# this app's own dev environment, created by a script in this repository. Do not
+# mark them as anything else, and do not reuse a marker an automated verification
+# run puts on records it leaves behind: those markers exist so that leftover data
+# can be found and removed before the app is handed over, and a fixture wearing
+# one would either hide real leftovers or get this app's own seed data counted as
+# somebody else's.
+#
+# IDEMPOTENT. It runs on every deploy. Each fixture is looked up by title first
+# and created only when it is absent, so a second deploy changes nothing.
+#
+# HOW A FIXTURE IS REMOVED. The FIXTURES list below IS the record of what this
+# script put in the app — nothing else creates records under those titles — so
+# removing them is deleting exactly those titles and nothing else. There is no
+# --remove mode here because the starter's API has no delete path to call; add
+# one alongside the delete endpoint if this app grows one. Dev is rebuilt from
+# the commit and live never runs this script, so neither needs one to be clean.
+#
+# Usage: scripts/seed-journey-fixtures.sh <app-base-url> [environment]
+#   app-base-url  the deployed app's origin; empty means there is nothing to seed.
+#   environment   defaults to $ENVIRONMENT. Only "dev" seeds.
+
+set -uo pipefail
+
+base_url="${1:-}"
+environment="${2:-${ENVIRONMENT:-}}"
+
+# THE FIXTURE SET. One line per record: "<collection>|<title>".
+#
+# EXTEND THIS LIST, not the app. A journey whose screens are empty is a journey
+# whose photographs say nothing, so the slice that builds a journey's screens adds
+# that journey's records here. Keep them realistic and plausible for this app's
+# own subject — not "Test 1", not lorem ipsum, and nothing naming the platform
+# that built the app.
+#
+# The starter's own collection is "items"; rename it and add your own as this app
+# grows real ones.
+FIXTURES=(
+    "items|Quarterly supplier review"
+    "items|Replace the loading bay lighting"
+    "items|Fire drill — north stairwell"
+)
+
+if [ -z "$base_url" ]; then
+    echo "no app URL — nothing to seed"
+    exit 0
+fi
+
+# The environment guard, and the reason live carries no fixtures. An unset or
+# unrecognised environment seeds nothing: the failure to avoid is inventing
+# records in somebody's production app, and not seeding costs a screenshot.
+if [ "$environment" != "dev" ]; then
+    echo "environment is '${environment:-unset}', not dev — no journey fixtures seeded"
+    exit 0
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "no curl on PATH — the journey fixtures are not seeded" >&2
+    exit 1
+fi
+
+base_url="${base_url%/}"
+
+# THE FIXTURES BELONG TO THE ACCOUNTS THAT LOOK AT THEM. This app has sign-in
+# (the cognito-auth pack rendered it), and every record is owned by the person
+# who created it, so a fixture created anonymously would be on nobody's screen
+# — and the API refuses an anonymous write anyway. Each fixture is therefore
+# seeded twice: as the VERIFIER account, which automated journey walks sign in
+# as, and as the DEMO account, which the app's owner and its screenshots see the
+# app through. Both are seeded into the pool by scripts/seed-demo-account.sh
+# earlier in the same job.
+#
+# THE PASSWORDS COME FROM THIS APP'S OWN PARAMETER STORE, under the deploy
+# identity, the channel scripts/seed-demo-account.sh reads them through. Each is
+# written to a 0600 file for one sign-in call and removed; neither reaches argv,
+# the environment of another step, or this repository. The session comes back
+# as a cookie, kept in a 0600 jar in a private directory removed on exit.
+#
+# An account whose password parameter does not exist is skipped with a warning,
+# as the account seed skips it.
+
+if ! command -v aws >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    echo "no aws cli or python3 on PATH — the journey fixtures are not seeded" >&2
+    exit 1
+fi
+
+repo_name="${GITHUB_REPOSITORY:-}"
+repo_name="${repo_name#*/}"
+workdir="$(mktemp -d)"
+chmod 700 "$workdir"
+trap 'rm -rf "$workdir"' EXIT
+jar="${workdir}/cookies"
+
+# sign_in USERNAME PARAMETER-NAME — signs in through the app's own
+# /api/auth/sign-in and leaves the session in $jar. Returns 0 when signed in,
+# 3 when the account's password parameter does not exist, 1 on any other
+# failure (which is printed).
+sign_in() {
+    local username="$1"
+    local param="/albitor/apps/${repo_name}/secrets/$2"
+    local payload="${workdir}/sign-in.json"
+    local read_status
+    local password
+
+    rm -f "$jar"
+    # Unquoted on purpose: an assignment never word-splits, and a quoted value
+    # after a credential-named variable reads as a committed secret.
+    password=$(aws ssm get-parameter --name "$param" --with-decryption \
+        --query Parameter.Value --output text 2>"${workdir}/read-error")
+    read_status=$?
+    if [ "$read_status" -ne 0 ]; then
+        if grep -q 'ParameterNotFound' "${workdir}/read-error"; then
+            return 3
+        fi
+        cat "${workdir}/read-error" >&2
+        echo "could not read ${param} — it is not missing, so this is not a skip" >&2
+        return 1
+    fi
+    if [ -z "$password" ] || [ "$password" = "None" ]; then
+        return 3
+    fi
+
+    (umask 077 && SEED_USERNAME="$username" SEED_PASSWORD="$password" python3 -c 'import json, os, sys
+json.dump({"email": os.environ["SEED_USERNAME"], "password": os.environ["SEED_PASSWORD"]}, open(sys.argv[1], "w"))' "$payload")
+    password=""
+    if ! curl -sS --fail-with-body -o /dev/null -c "$jar" \
+        -H 'Content-Type: application/json' --data "@${payload}" \
+        "${base_url}/api/auth/sign-in"; then
+        rm -f "$payload"
+        echo "could not sign in to ${base_url} as ${username}" >&2
+        return 1
+    fi
+    rm -f "$payload"
+    return 0
+}
+
+# api METHOD PATH [BODY] — one call to the app's own API, in the session sign_in
+# left. Echoes the body; a non-2xx answer is a non-zero status, never swallowed.
+api() {
+    local method="$1"
+    local path="$2"
+    local body="${3:-}"
+    local args=(-sS --fail-with-body -X "$method" -b "$jar" -H 'Content-Type: application/json')
+    [ -z "$body" ] || args+=(--data "$body")
+    curl "${args[@]}" "${base_url}${path}"
+}
+
+# has_title COLLECTION TITLE — is this record already there? The lookup is what
+# makes the second deploy a no-op. It is a substring test over the collection's
+# JSON rather than a parse, so this script needs no jq on the runner.
+has_title() {
+    local collection="$1"
+    local title="$2"
+    api GET "/api/${collection}" | grep -qF "\"${title}\""
+}
+
+# json_string VALUE — quote one string for a JSON body without needing jq.
+json_string() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+status=0
+
+# seed_as LABEL USERNAME PARAMETER-NAME — the whole fixture set, as one account.
+seed_as() {
+    local label="$1"
+    local created=0
+    local present=0
+    local rc
+
+    sign_in "$2" "$3"
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+        echo "::warning title=fixtures-skipped::no password parameter for the ${label} account, so its journey fixtures are not seeded"
+        return 0
+    fi
+    [ "$rc" -eq 0 ] || return 1
+
+    for fixture in "${FIXTURES[@]}"; do
+        collection="${fixture%%|*}"
+        title="${fixture#*|}"
+
+        if has_title "$collection" "$title"; then
+            present=$((present + 1))
+            continue
+        fi
+
+        if ! api POST "/api/${collection}" "{\"title\":\"$(json_string "$title")\"}" >/dev/null; then
+            echo "could not seed '${title}' into ${collection} as the ${label} account" >&2
+            status=1
+            continue
+        fi
+        created=$((created + 1))
+    done
+    echo "journey fixtures for the ${label} account: ${created} created, ${present} already present"
+}
+
+seed_as verifier "${VERIFIER_ACCOUNT_USERNAME:-verifier@albitor-verify.invalid}" ALBITOR_VERIFIER_ACCOUNT_PASSWORD || status=1
+seed_as demo "${DEMO_ACCOUNT_USERNAME:-demo@albitor-demo.invalid}" ALBITOR_DEMO_ACCOUNT_PASSWORD || status=1
+
+exit "$status"

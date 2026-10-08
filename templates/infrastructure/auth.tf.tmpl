@@ -1,0 +1,173 @@
+# Sign-in for this app: a Cognito user pool and the public client the API signs
+# people in through. Rendered by the cognito-auth pack when the repository was
+# created. It is a starting point, not a lease: change it when the app needs to,
+# and the deploy gates check what you ship.
+#
+# WHAT THE REST OF THE REPOSITORY RELIES ON HERE
+#   - The outputs auth_user_pool_id and auth_client_id. The deploy workflow reads
+#     them, seeds the demo and verifier accounts into the pool
+#     (scripts/seed-demo-account.sh, under the deploy identity), and reports both
+#     on the deploy receipt.
+#   - ALLOW_USER_PASSWORD_AUTH on the client. The verifier signs in with a
+#     username and password and no second factor.
+#   - The auth config parameter below, which is how the API learns the pool and
+#     client it verifies tokens against (api/server/auth_cognito.go).
+#
+# DO NOT WEAKEN THE POOL
+#   - No lambda_config and no pre-sign-up trigger. A trigger that confirms one
+#     sign-up confirms every sign-up, so anyone could own an account for an
+#     address they do not control.
+#   - No user-pool admin action on the API's role. The two seeded accounts are
+#     created by the deploy identity, never by the function serving requests.
+#   - Keep the password policy at or above the one below (ASVS 2.1.1: at least
+#     12 characters).
+
+variable "cognito_email_from" {
+  description = "Verified From address for the user pool's email, e.g. \"no-reply@example.com\". Empty keeps Cognito's default sender (50 emails a day per AWS account, shared by every app in it)."
+  type        = string
+  default     = ""
+}
+
+variable "cognito_email_ses_identity_arn" {
+  description = "ARN of the verified SES identity (domain or address) the pool sends through, in the pool's Region. Empty keeps Cognito's default sender."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = (var.cognito_email_ses_identity_arn == "") == (var.cognito_email_from == "")
+    error_message = "Set cognito_email_from and cognito_email_ses_identity_arn together, or leave both empty."
+  }
+}
+
+locals {
+  # SES-backed sending only when both variables are set. The SES identity sends
+  # account, two-factor and recovery mail only: no marketing.
+  cognito_ses_email = var.cognito_email_from != "" && var.cognito_email_ses_identity_arn != ""
+}
+
+resource "aws_cognito_user_pool" "auth" {
+  name = "${local.name_prefix}-users"
+
+  # People sign in with their email address, and must prove they own it: Cognito
+  # emails a code and the confirm-code screen takes it.
+  username_attributes      = ["email"]
+  auto_verified_attributes = ["email"]
+
+  # Ada@Example.com and ada@example.com are one person.
+  username_configuration {
+    case_sensitive = false
+  }
+
+  # No second factor. The verifier signs in non-interactively, and a brief that
+  # asks for MFA turns it on here (OPTIONAL keeps the verifier working).
+  mfa_configuration = "OFF"
+
+  password_policy {
+    minimum_length                   = 12
+    require_lowercase                = true
+    require_uppercase                = true
+    require_numbers                  = true
+    require_symbols                  = false
+    temporary_password_validity_days = 7
+  }
+
+  admin_create_user_config {
+    allow_admin_create_user_only = false
+  }
+
+  verification_message_template {
+    default_email_option = "CONFIRM_WITH_CODE"
+    email_subject        = "Your ${var.project_name} verification code"
+    email_message        = "Your ${var.project_name} verification code is {####}"
+  }
+
+  # A changed email address is not used until the new one is confirmed.
+  user_attribute_update_settings {
+    attributes_require_verification_before_update = ["email"]
+  }
+
+  account_recovery_setting {
+    recovery_mechanism {
+      name     = "verified_email"
+      priority = 1
+    }
+  }
+
+  email_configuration {
+    email_sending_account = local.cognito_ses_email ? "DEVELOPER" : "COGNITO_DEFAULT"
+    from_email_address    = local.cognito_ses_email ? var.cognito_email_from : null
+    source_arn            = local.cognito_ses_email ? var.cognito_email_ses_identity_arn : null
+  }
+
+  tags = local.tags
+}
+
+# The public client. No secret: the API proxies the sign-in calls, but the
+# client stays public so the verifier and any browser flow can use it too.
+resource "aws_cognito_user_pool_client" "web" {
+  name         = "${local.name_prefix}-web"
+  user_pool_id = aws_cognito_user_pool.auth.id
+
+  generate_secret = false
+
+  explicit_auth_flows = [
+    "ALLOW_USER_PASSWORD_AUTH",
+    "ALLOW_USER_SRP_AUTH",
+    "ALLOW_REFRESH_TOKEN_AUTH",
+  ]
+
+  # Sign-in and reset answer the same way whether or not the address has an
+  # account.
+  prevent_user_existence_errors = "ENABLED"
+  enable_token_revocation       = true
+
+  access_token_validity  = 60
+  id_token_validity      = 60
+  refresh_token_validity = 30
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
+}
+
+# HOW THE API LEARNS WHICH POOL IT TRUSTS. The function's environment is set in
+# lambda.tf, which this file does not own, so the pool and client ids reach the
+# API through one plain parameter named after the function. The API reads it
+# once per cold start. Neither id is a secret.
+resource "aws_ssm_parameter" "auth_config" {
+  name        = "/${aws_lambda_function.api.function_name}/auth/config"
+  description = "The user pool and client the API verifies sign-in tokens against."
+  type        = "String"
+  value = jsonencode({
+    region       = var.aws_region
+    user_pool_id = aws_cognito_user_pool.auth.id
+    client_id    = aws_cognito_user_pool_client.web.id
+  })
+  tags = local.tags
+}
+
+# The API may read that one parameter and nothing else here. It holds no
+# user-pool action: the sign-in calls it makes are the pool's public ones.
+resource "aws_iam_role_policy" "lambda_auth_config" {
+  name = "auth-config-read"
+  role = aws_iam_role.lambda.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter"]
+      Resource = aws_ssm_parameter.auth_config.arn
+    }]
+  })
+}
+
+output "auth_user_pool_id" {
+  description = "The Cognito user pool. deploy.yml seeds the demo and verifier accounts into it."
+  value       = aws_cognito_user_pool.auth.id
+}
+
+output "auth_client_id" {
+  description = "The public app client people and the verifier sign in through."
+  value       = aws_cognito_user_pool_client.web.id
+}

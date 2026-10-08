@@ -1,0 +1,504 @@
+package server
+
+import (
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// These tests hold the identity seam to its contract: /api/health and the
+// sign-in calls open, every other /api/ route refused without a verified
+// token, the owner taken from the token's sub, and nothing let through when the
+// pool cannot be reached. A fake Cognito serves the JWKS and the public calls.
+
+const (
+	testClientID = "client-under-test"
+	testKid      = "key-1"
+)
+
+type fakeCognito struct {
+	t      *testing.T
+	key    *rsa.PrivateKey
+	issuer string
+
+	mu      sync.Mutex
+	calls   []string
+	answers map[string]func(in map[string]any) (int, any)
+}
+
+func newFakeCognito(t *testing.T) (*fakeCognito, *httptest.Server) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeCognito{t: t, key: key, answers: map[string]func(map[string]any) (int, any){}}
+	srv := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(srv.Close)
+	f.issuer = srv.URL + "/pool"
+	return f, srv
+}
+
+func (f *fakeCognito) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/pool/.well-known/jwks.json" {
+		pub := f.key.PublicKey
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kid": testKid, "kty": "RSA", "alg": "RS256", "use": "sig",
+			"n": base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+		}}})
+		return
+	}
+	op := strings.TrimPrefix(r.Header.Get("X-Amz-Target"), "AWSCognitoIdentityProviderService.")
+	var in map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	f.mu.Lock()
+	f.calls = append(f.calls, op)
+	answer := f.answers[op]
+	f.mu.Unlock()
+	if answer == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"__type":"InternalErrorException","message":"unexpected call"}`)
+		return
+	}
+	status, body := answer(in)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func (f *fakeCognito) answer(op string, fn func(in map[string]any) (int, any)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.answers[op] = fn
+}
+
+func (f *fakeCognito) called(op string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if c == op {
+			return true
+		}
+	}
+	return false
+}
+
+// token signs claims over the defaults of a valid ID token for sub.
+func (f *fakeCognito) token(sub string, override map[string]any) string {
+	return signToken(f.t, f.key, testKid, "RS256", f.claims(sub, override))
+}
+
+func (f *fakeCognito) claims(sub string, override map[string]any) map[string]any {
+	now := time.Now()
+	claims := map[string]any{
+		"iss": f.issuer, "sub": sub, "aud": testClientID, "token_use": "id",
+		"email": sub + "@example.invalid", "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+	}
+	for k, v := range override {
+		claims[k] = v
+	}
+	return claims
+}
+
+func signToken(t *testing.T, key *rsa.PrivateKey, kid, alg string, claims map[string]any) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	signing := enc(map[string]string{"alg": alg, "kid": kid}) + "." + enc(claims)
+	digest := sha256.Sum256([]byte(signing))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// testMux stands in for New's mux: a health check, one user-owned route that
+// echoes its owner, and the catch-all JSON 404.
+func authTestMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/api/items", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"owner": ownerFromRequest(r)})
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "not found")
+	})
+	return mux
+}
+
+func gateFor(f *fakeCognito, srv *httptest.Server) http.Handler {
+	auth := &cognitoAuth{
+		clientID: testClientID,
+		endpoint: srv.URL + "/",
+		client:   srv.Client(),
+		verifier: newTokenVerifier(f.issuer, testClientID, f.issuer+"/.well-known/jwks.json", srv.Client()),
+	}
+	source := &authSource{load: func(context.Context) (*cognitoAuth, error) { return auth, nil }}
+	return newIdentityGate(authTestMux(), source, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func authDo(t *testing.T, h http.Handler, method, path, body string, edit func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if edit != nil {
+		edit(req)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func withBearer(token string) func(*http.Request) {
+	return func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+token) }
+}
+
+func withCookies(cookies ...*http.Cookie) func(*http.Request) {
+	return func(r *http.Request) {
+		for _, c := range cookies {
+			r.AddCookie(c)
+		}
+	}
+}
+
+func authDecode(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("response is not JSON: %q", rec.Body.String())
+	}
+	return out
+}
+
+func TestHealthAndUnknownRoutesNeedNoSignIn(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+
+	if rec := authDo(t, h, http.MethodGet, "/api/health", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/health = %d, want 200", rec.Code)
+	}
+	// The deploy's smoke check wants an unknown /api/ path to be a JSON 404.
+	if rec := authDo(t, h, http.MethodGet, "/api/no-such-route", "", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /api/no-such-route = %d, want 404", rec.Code)
+	}
+}
+
+func TestAProtectedRouteRefusesARequestWithoutAVerifiedToken(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]func(*http.Request){
+		"no token":            nil,
+		"not a token":         withBearer("not-a-token"),
+		"signed by another":   withBearer(signToken(t, other, testKid, "RS256", f.claims("intruder", nil))),
+		"alg none":            withBearer(signToken(t, f.key, testKid, "none", f.claims("intruder", nil))),
+		"another pool":        withBearer(f.token("intruder", map[string]any{"iss": "https://cognito-idp.eu-west-2.amazonaws.com/other"})),
+		"another client":      withBearer(f.token("intruder", map[string]any{"aud": "other-client"})),
+		"refresh token use":   withBearer(f.token("intruder", map[string]any{"token_use": "refresh"})),
+		"expired":             withBearer(f.token("intruder", map[string]any{"exp": time.Now().Add(-time.Minute).Unix()})),
+		"unknown kid":         withBearer(signToken(t, f.key, "key-2", "RS256", f.claims("intruder", nil))),
+		"basic auth":          func(r *http.Request) { r.SetBasicAuth("someone", "anything") },
+		"expired, no refresh": withCookies(&http.Cookie{Name: sessionCookie, Value: f.token("intruder", map[string]any{"exp": time.Now().Add(-time.Minute).Unix()})}),
+	}
+	for name, edit := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := authDo(t, h, http.MethodGet, "/api/items", "", edit)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("GET /api/items = %d, want 401: %s", rec.Code, rec.Body.String())
+			}
+			if got := authDecode(t, rec)["code"]; got != "unauthenticated" {
+				t.Fatalf("code = %v, want unauthenticated", got)
+			}
+		})
+	}
+}
+
+func TestTheOwnerIsTheVerifiedSub(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+
+	for name, edit := range map[string]func(*http.Request){
+		"bearer id token":     withBearer(f.token("user-a", nil)),
+		"bearer access token": withBearer(f.token("user-a", map[string]any{"token_use": "access", "aud": nil, "client_id": testClientID})),
+		"session cookie":      withCookies(&http.Cookie{Name: sessionCookie, Value: f.token("user-a", nil)}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := authDo(t, h, http.MethodGet, "/api/items", "", edit)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET /api/items = %d: %s", rec.Code, rec.Body.String())
+			}
+			if got := authDecode(t, rec)["owner"]; got != "user-a" {
+				t.Fatalf("owner = %v, want user-a", got)
+			}
+		})
+	}
+}
+
+func TestMeAnswersTheSignedInPerson(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+
+	if rec := authDo(t, h, http.MethodGet, "/api/me", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/me signed out = %d, want 401", rec.Code)
+	}
+	rec := authDo(t, h, http.MethodGet, "/api/me", "", withBearer(f.token("user-a", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/me = %d", rec.Code)
+	}
+	me := authDecode(t, rec)
+	if me["sub"] != "user-a" || me["email"] != "user-a@example.invalid" {
+		t.Fatalf("GET /api/me = %v", me)
+	}
+}
+
+func TestAnExpiredSessionIsRefreshedFromTheRefreshCookie(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+	f.answer("InitiateAuth", func(in map[string]any) (int, any) {
+		params, _ := in["AuthParameters"].(map[string]any)
+		if in["AuthFlow"] != "REFRESH_TOKEN_AUTH" || params["REFRESH_TOKEN"] != "refresh-a" {
+			return http.StatusBadRequest, map[string]string{"__type": "NotAuthorizedException"}
+		}
+		return http.StatusOK, map[string]any{"AuthenticationResult": map[string]string{"IdToken": f.token("user-a", nil)}}
+	})
+
+	expired := f.token("user-a", map[string]any{"exp": time.Now().Add(-time.Minute).Unix()})
+	rec := authDo(t, h, http.MethodGet, "/api/items", "", withCookies(
+		&http.Cookie{Name: sessionCookie, Value: expired},
+		&http.Cookie{Name: refreshCookie, Value: "refresh-a"},
+	))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/items = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := authDecode(t, rec)["owner"]; got != "user-a" {
+		t.Fatalf("owner = %v", got)
+	}
+	session := responseCookie(rec, sessionCookie)
+	if session == nil || session.Value == "" || session.Value == expired {
+		t.Fatalf("the refreshed session was not set: %v", rec.Result().Cookies())
+	}
+
+	// A refresh token the pool refuses ends the session.
+	rec = authDo(t, h, http.MethodGet, "/api/items", "", withCookies(
+		&http.Cookie{Name: sessionCookie, Value: expired},
+		&http.Cookie{Name: refreshCookie, Value: "revoked"},
+	))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/items with a revoked refresh = %d, want 401", rec.Code)
+	}
+	if c := responseCookie(rec, sessionCookie); c == nil || c.MaxAge >= 0 {
+		t.Fatalf("the dead session was not cleared: %v", rec.Result().Cookies())
+	}
+}
+
+func responseCookie(rec *httptest.ResponseRecorder, name string) *http.Cookie {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+func TestSignInSetsAnHttpOnlySession(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+	f.answer("InitiateAuth", func(in map[string]any) (int, any) {
+		params, _ := in["AuthParameters"].(map[string]any)
+		switch {
+		case in["AuthFlow"] != "USER_PASSWORD_AUTH":
+			return http.StatusBadRequest, map[string]string{"__type": "InvalidParameterException"}
+		case params["USERNAME"] == "unconfirmed@example.invalid":
+			return http.StatusBadRequest, map[string]string{"__type": "UserNotConfirmedException", "message": "User is not confirmed."}
+		case params["USERNAME"] != "verifier@example.invalid" || params["PASSWORD"] != "right-one":
+			return http.StatusBadRequest, map[string]string{"__type": "com.amazonaws#NotAuthorizedException", "message": "Incorrect username or password."}
+		}
+		return http.StatusOK, map[string]any{"AuthenticationResult": map[string]string{
+			"IdToken": f.token("verifier", nil), "AccessToken": "access", "RefreshToken": "refresh-v",
+		}}
+	})
+
+	rec := authDo(t, h, http.MethodPost, "/api/auth/sign-in", `{"email":" Verifier@Example.invalid ","password":"right-one"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sign-in = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := authDecode(t, rec)["sub"]; got != "verifier" {
+		t.Fatalf("sign-in answered sub %v", got)
+	}
+	if strings.Contains(rec.Body.String(), "refresh-v") || strings.Contains(rec.Body.String(), "access") {
+		t.Fatalf("sign-in put a token in the body: %s", rec.Body.String())
+	}
+	for _, name := range []string{sessionCookie, refreshCookie} {
+		c := responseCookie(rec, name)
+		if c == nil || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteStrictMode {
+			t.Fatalf("%s cookie = %+v, want HttpOnly, Secure, SameSite=Strict", name, c)
+		}
+	}
+
+	// Another site's form can post text/plain; a sign-in from one is refused.
+	formPost := authDo(t, h, http.MethodPost, "/api/auth/sign-in", `{"email":"verifier@example.invalid","password":"right-one"}`,
+		func(r *http.Request) { r.Header.Set("Content-Type", "text/plain") })
+	if formPost.Code != http.StatusUnsupportedMediaType || responseCookie(formPost, sessionCookie) != nil {
+		t.Fatalf("a text/plain sign-in = %d, want 415 and no session", formPost.Code)
+	}
+
+	for body, want := range map[string]string{
+		`{"email":"verifier@example.invalid","password":"wrong"}`:        "invalid_credentials",
+		`{"email":"unconfirmed@example.invalid","password":"right-one"}`: "not_confirmed",
+		`{"password":"right-one"}`:                                       "invalid_input",
+	} {
+		rec := authDo(t, h, http.MethodPost, "/api/auth/sign-in", body, nil)
+		if got := authDecode(t, rec)["code"]; got != want {
+			t.Fatalf("sign-in %s: code %v, want %s", body, got, want)
+		}
+		if responseCookie(rec, sessionCookie) != nil {
+			t.Fatalf("a failed sign-in set a session")
+		}
+	}
+}
+
+func TestSignUpConfirmAndResetReachThePool(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+	ok := func(map[string]any) (int, any) { return http.StatusOK, map[string]any{} }
+	f.answer("SignUp", func(in map[string]any) (int, any) {
+		if in["ClientId"] != testClientID || in["Username"] != "new@example.invalid" {
+			return http.StatusBadRequest, map[string]string{"__type": "InvalidParameterException"}
+		}
+		return http.StatusOK, map[string]any{"UserConfirmed": false, "UserSub": "new"}
+	})
+	f.answer("ConfirmSignUp", func(in map[string]any) (int, any) {
+		if in["ConfirmationCode"] != "123456" {
+			return http.StatusBadRequest, map[string]string{"__type": "CodeMismatchException"}
+		}
+		return http.StatusOK, map[string]any{}
+	})
+	f.answer("ResendConfirmationCode", ok)
+	f.answer("ForgotPassword", ok)
+	f.answer("ConfirmForgotPassword", ok)
+
+	steps := []struct {
+		path, body string
+		status     int
+		code       string
+	}{
+		{"/api/auth/sign-up", `{"email":"new@example.invalid","password":"Long-enough-1"}`, http.StatusCreated, ""},
+		{"/api/auth/confirm", `{"email":"new@example.invalid","code":"000000"}`, http.StatusBadRequest, "invalid_code"},
+		{"/api/auth/confirm", `{"email":"new@example.invalid","code":"123456"}`, http.StatusNoContent, ""},
+		{"/api/auth/resend", `{"email":"new@example.invalid"}`, http.StatusNoContent, ""},
+		{"/api/auth/forgot", `{"email":"new@example.invalid"}`, http.StatusNoContent, ""},
+		{"/api/auth/reset", `{"email":"new@example.invalid","code":"123456","password":"Long-enough-2"}`, http.StatusNoContent, ""},
+		{"/api/auth/unknown", `{"email":"new@example.invalid"}`, http.StatusNotFound, ""},
+	}
+	for _, s := range steps {
+		rec := authDo(t, h, http.MethodPost, s.path, s.body, nil)
+		if rec.Code != s.status {
+			t.Fatalf("POST %s = %d, want %d: %s", s.path, rec.Code, s.status, rec.Body.String())
+		}
+		if s.code != "" {
+			if got := authDecode(t, rec)["code"]; got != s.code {
+				t.Fatalf("POST %s code = %v, want %s", s.path, got, s.code)
+			}
+		}
+	}
+	if rec := authDo(t, h, http.MethodGet, "/api/auth/sign-in", "", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /api/auth/sign-in = %d, want 404", rec.Code)
+	}
+}
+
+func TestSignOutRevokesAndClears(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+	f.answer("RevokeToken", func(map[string]any) (int, any) { return http.StatusOK, map[string]any{} })
+
+	rec := authDo(t, h, http.MethodPost, "/api/auth/sign-out", "", withCookies(&http.Cookie{Name: refreshCookie, Value: "refresh-a"}))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("sign-out = %d", rec.Code)
+	}
+	if !f.called("RevokeToken") {
+		t.Fatal("sign-out did not revoke the refresh token")
+	}
+	for _, name := range []string{sessionCookie, refreshCookie} {
+		if c := responseCookie(rec, name); c == nil || c.MaxAge >= 0 {
+			t.Fatalf("sign-out did not clear %s", name)
+		}
+	}
+}
+
+func TestNoPoolFailsClosedOnADeployedFunction(t *testing.T) {
+	source := &authSource{load: func(context.Context) (*cognitoAuth, error) {
+		return nil, errors.New("parameter not found")
+	}}
+	h := newIdentityGate(authTestMux(), source, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if rec := authDo(t, h, http.MethodGet, "/api/health", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/health = %d, want 200 even with no pool", rec.Code)
+	}
+	for _, path := range []string{"/api/items", "/api/me"} {
+		if rec := authDo(t, h, http.MethodGet, path, "", nil); rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("GET %s = %d, want 503", path, rec.Code)
+		}
+	}
+}
+
+func TestAuthSourceFromEnv(t *testing.T) {
+	env := func(vars map[string]string) func(string) string {
+		return func(k string) string { return vars[k] }
+	}
+	if s := authSourceFromEnv(env(map[string]string{})); s != nil {
+		t.Fatal("no pool and no deployed function should mean no sign-in")
+	}
+	if s := authSourceFromEnv(env(map[string]string{lambdaNameEnv: "app-dev-api"})); s == nil {
+		t.Fatal("a deployed function must always have sign-in")
+	}
+	s := authSourceFromEnv(env(map[string]string{AuthUserPoolIDEnv: "eu-west-2_abc"}))
+	if s == nil {
+		t.Fatal("a named pool must mean sign-in")
+	}
+	if _, err := s.get(context.Background()); err == nil {
+		t.Fatal("a pool with no client or region must not load")
+	}
+}
+
+func TestWithoutAPoolEveryRequestIsAnonymous(t *testing.T) {
+	h := newIdentityGate(authTestMux(), nil, nil)
+
+	rec := authDo(t, h, http.MethodGet, "/api/items", "", nil)
+	if got := authDecode(t, rec)["owner"]; got != AnonymousOwner {
+		t.Fatalf("owner = %v, want %s", got, AnonymousOwner)
+	}
+	if rec := authDo(t, h, http.MethodGet, "/api/me", "", nil); authDecode(t, rec)["sub"] != AnonymousOwner {
+		t.Fatalf("GET /api/me = %s", rec.Body.String())
+	}
+	if rec := authDo(t, h, http.MethodPost, "/api/auth/sign-in", `{}`, nil); rec.Code != http.StatusNotImplemented {
+		t.Fatalf("sign-in with no pool = %d, want 501", rec.Code)
+	}
+}
