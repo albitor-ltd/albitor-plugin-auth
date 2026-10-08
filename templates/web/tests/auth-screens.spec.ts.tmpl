@@ -37,3 +37,25 @@ test("the confirm-code screen takes the address it was sent to", async ({ page }
   await expect(page.getByTestId("confirm-code")).toBeEditable();
   await expect(page.getByTestId("confirm-resend")).toBeEnabled();
 });
+
+// Where sign-in sends the visitor afterwards comes from ?next=, so it must never
+// leave this site: not by a scheme-relative URL, a backslash, an absolute URL,
+// or a tab or newline the browser strips before it navigates.
+test("the post-sign-in redirect stays on this site", async ({ page }) => {
+  const cases: [string, string][] = [
+    ["/items?page=2#top", "/items?page=2#top"],
+    ["//evil.example/x", "/"],
+    ["/\\evil.example/x", "/"],
+    ["/\t/evil.example/x", "/"],
+    ["/\n/evil.example/x", "/"],
+    ["\t//evil.example/x", "/"],
+    ["https://evil.example/x", "/"],
+    ["javascript:alert(1)", "/"],
+  ];
+  for (const [next, want] of cases) {
+    await page.goto(`/sign-in?next=${encodeURIComponent(next)}`);
+    await expect(page.getByTestId("sign-in-form")).toBeVisible();
+    const got = await page.evaluate(() => (window as unknown as { safeNext: () => string }).safeNext());
+    expect(got, `next=${JSON.stringify(next)}`).toBe(want);
+  }
+});

@@ -18,10 +18,18 @@ const byTestId = (id) => document.querySelector(`[data-testid="${id}"]`);
 const params = new URLSearchParams(window.location.search);
 
 // safeNext returns where to go after signing in: a path on this site, never
-// another origin.
+// another origin. It parses the value the way the browser will rather than
+// pattern-matching it: a prefix check misses "/\t/evil.example", whose tab the
+// browser strips into "//evil.example". Anything that resolves off this origin,
+// or does not parse, goes home.
 function safeNext() {
   const next = params.get("next") || "/";
-  return next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/\\") ? next : "/";
+  try {
+    const url = new URL(next, window.location.origin);
+    return url.origin === window.location.origin ? url.pathname + url.search + url.hash : "/";
+  } catch {
+    return "/";
+  }
 }
 
 // showScreen shows one sign-in screen and names the tab after it.
