@@ -14,10 +14,13 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"webapp/internal/localauth"
 )
 
 // These tests hold the identity seam to its contract: /api/health and the
@@ -500,5 +503,154 @@ func TestWithoutAPoolEveryRequestIsAnonymous(t *testing.T) {
 	}
 	if rec := authDo(t, h, http.MethodPost, "/api/auth/sign-in", `{}`, nil); rec.Code != http.StatusNotImplemented {
 		t.Fatalf("sign-in with no pool = %d, want 501", rec.Code)
+	}
+}
+
+// The local issuer is trusted in a local run with ALBITOR_LOCAL_AUTH=1, and
+// never where a pool is named or the function is deployed, whatever else is set.
+func TestTheLocalIssuerIsTrustedOnlyInALocalRun(t *testing.T) {
+	env := func(vars map[string]string) func(string) string {
+		return func(k string) string { return vars[k] }
+	}
+	local := map[string]string{localModeEnv: "1", localIssuerEnv: "1", "PORT": "8080"}
+
+	s := authSourceFromEnv(env(local))
+	if s == nil || !s.local {
+		t.Fatal("a local run with the local issuer must trust it")
+	}
+	auth, err := s.get(context.Background())
+	if err != nil || !auth.local || auth.verifier.issuer != "http://localhost:8080"+localIssuerPath || auth.clientID != localIssuerClientID {
+		t.Fatalf("local source = %+v, %v; want the local issuer's URL and client", auth, err)
+	}
+
+	with := func(extra map[string]string) map[string]string {
+		out := map[string]string{}
+		for k, v := range local {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+	for name, vars := range map[string]map[string]string{
+		"on a deployed function": with(map[string]string{lambdaNameEnv: "app-dev-api"}),
+		"beside a named pool":    with(map[string]string{AuthUserPoolIDEnv: "eu-west-2_abc", AuthClientIDEnv: "c", awsRegionEnv: "eu-west-2"}),
+		"beside a client id":     with(map[string]string{AuthClientIDEnv: "c"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if s := authSourceFromEnv(env(vars)); s == nil || s.local {
+				t.Fatal("the local issuer was trusted where a pool or a deployed function decides")
+			}
+		})
+	}
+	for name, vars := range map[string]map[string]string{
+		"without local mode": {localIssuerEnv: "1"},
+		"local mode not 1":   {localModeEnv: "true", localIssuerEnv: "1"},
+		"issuer not 1":       {localModeEnv: "1", localIssuerEnv: "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if s := authSourceFromEnv(env(vars)); s != nil {
+				t.Fatal("the local issuer was trusted without both local switches")
+			}
+		})
+	}
+}
+
+// startLocalIssuer starts the starter's local issuer as a local run does,
+// serving h on a real port so its JWKS can be fetched.
+func startLocalIssuer(t *testing.T, build func() http.Handler) (*httptest.Server, *localauth.Issuer) {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(nil)
+	port := strings.TrimPrefix(srv.Listener.Addr().String(), "127.0.0.1:")
+	t.Setenv(localModeEnv, "1")
+	t.Setenv(localIssuerEnv, "1")
+	t.Setenv("PORT", port)
+	issuer, err := localauth.Open(func(k string) string { return os.Getenv(k) })
+	if err != nil || issuer == nil {
+		t.Fatalf("localauth.Open = %v, %v", issuer, err)
+	}
+	srv.Config.Handler = issuer.Wrap(build())
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv, issuer
+}
+
+// A pool's verifier refuses the local issuer's tokens: another issuer, and a
+// key the pool never published.
+func TestAPoolRefusesTheLocalIssuersTokens(t *testing.T) {
+	f, srv := newFakeCognito(t)
+	h := gateFor(f, srv)
+	_, issuer := startLocalIssuer(t, func() http.Handler { return authTestMux() })
+	tokens, err := issuer.Mint("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, token := range map[string]string{"id token": tokens.IDToken, "access token": tokens.AccessToken} {
+		if rec := authDo(t, h, http.MethodGet, "/api/items", "", withBearer(token)); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s from the local issuer = %d, want 401", name, rec.Code)
+		}
+	}
+	// Control: the pool's own token passes, so the refusal is the verifier's.
+	if rec := authDo(t, h, http.MethodGet, "/api/items", "", withBearer(f.token("user-a", nil))); rec.Code != http.StatusOK {
+		t.Fatalf("the pool's own token = %d, want 200", rec.Code)
+	}
+}
+
+// The local run's acceptance check: two test identities signed in through the
+// local issuer are two subjects to the API, each with its own records, with no
+// sign-up, no e-mail and no call to Cognito.
+func TestTwoLocalIdentitiesAreTwoSubjects(t *testing.T) {
+	srv, _ := startLocalIssuer(t, func() http.Handler {
+		h, err := New(newMemStore(), NewSecrets(nil, "", SecretTTL, time.Now), slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	})
+	call := func(method, path, body, token string) (int, map[string]any) {
+		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	signIn := func(name string) string {
+		status, out := call(http.MethodPost, localIssuerPath+"/token", `{"identity":"`+name+`"}`, "")
+		if status != http.StatusOK {
+			t.Fatalf("local sign-in as %s = %d", name, status)
+		}
+		return out["id_token"].(string)
+	}
+	alice, bob := signIn("alice"), signIn("bob")
+
+	if status, _ := call(http.MethodGet, "/api/items", "", ""); status != http.StatusUnauthorized {
+		t.Fatalf("GET /api/items with no token = %d, want 401", status)
+	}
+	_, aliceMe := call(http.MethodGet, "/api/me", "", alice)
+	_, bobMe := call(http.MethodGet, "/api/me", "", bob)
+	if aliceMe["sub"] == nil || aliceMe["sub"] == bobMe["sub"] {
+		t.Fatalf("subjects alice=%v bob=%v, want two different ones", aliceMe["sub"], bobMe["sub"])
+	}
+	if status, _ := call(http.MethodPost, "/api/items", `{"title":"alice's"}`, alice); status != http.StatusCreated {
+		t.Fatalf("alice POST /api/items = %d", status)
+	}
+	_, bobs := call(http.MethodGet, "/api/items", "", bob)
+	if items, _ := bobs["items"].([]any); len(items) != 0 {
+		t.Fatalf("bob sees %d items, want none of alice's", len(items))
+	}
+	if status, out := call(http.MethodPost, "/api/auth/sign-in", `{"email":"a@example.invalid","password":"x"}`, ""); status != http.StatusNotImplemented || out["code"] != "local" {
+		t.Fatalf("sign-in call in a local run = %d %v, want 501 local", status, out)
 	}
 }

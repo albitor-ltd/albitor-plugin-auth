@@ -22,11 +22,24 @@ sign-in (`password`). Templates are plain files: the platform substitutes only i
 | `web/public/index.html`, `auth.js`, `auth.css` | Sign-in, sign-up, confirm-code and reset screens with stable `data-testid`s |
 | `web/serve.mjs` | The local static server, serving the shell for route paths as CloudFront does |
 | `web/tests/auth.setup.ts`, `web/tests/auth-screens.spec.ts` | `SIGN_IN_SCREEN_EXISTS = true`, and a signed-out spec of the screens |
+| `web/tests/local-sign-in.spec.ts` | Two test identities signed in through the starter's local issuer are two subjects; skips outside a local run with it |
 | `scripts/seed-journey-fixtures.sh` | Journey fixtures seeded as the verifier and the demo account |
 
 Every pack version's rendered tree is gated at ingest by the platform's floor checks, so a build
 starts from a tree that passes. A build may then change any rendered file; the same gates run on
 what it ships.
+
+#### A local run trusts the starter's local issuer, and nothing else does
+
+The starter ships a local issuer (`api/internal/localauth`): with `ALBITOR_LOCAL=1
+ALBITOR_LOCAL_AUTH=1` the API starts an in-process stand-in for the pool that mints Cognito-shaped
+tokens for the test identities `alice`, `bob` and `admin`, so specs sign in without sign-up,
+e-mail or a call to Cognito. `auth_cognito.go`'s `authSourceFromEnv` trusts it only in that case:
+a named pool (`AUTH_USER_POOL_ID`/`AUTH_CLIENT_ID`) or a deployed function
+(`AWS_LAMBDA_FUNCTION_NAME`, set by the Lambda runtime) is decided first and never trusts it, and
+the issuer itself refuses to start in either. In a local run the sign-in calls (`POST
+/api/auth/*`) answer 501 `local`. The issuer's URL, key path and client id are its contract,
+restated in `auth_cognito.go` so the pack does not import the starter's package.
 
 ### Skill (loads automatically when relevant)
 

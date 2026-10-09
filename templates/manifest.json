@@ -20,6 +20,7 @@
     "web/serve.mjs": "web/serve.mjs.tmpl",
     "web/tests/auth.setup.ts": "web/tests/auth.setup.ts.tmpl",
     "web/tests/auth-screens.spec.ts": "web/tests/auth-screens.spec.ts.tmpl",
-    "scripts/seed-journey-fixtures.sh": "scripts/seed-journey-fixtures.sh.tmpl"
+    "scripts/seed-journey-fixtures.sh": "scripts/seed-journey-fixtures.sh.tmpl",
+    "web/tests/local-sign-in.spec.ts": "web/tests/local-sign-in.spec.ts.tmpl"
   }
 }

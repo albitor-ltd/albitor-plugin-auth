@@ -26,8 +26,10 @@ import (
 // or another client may send `Authorization: Bearer <token>` instead.
 
 // AnonymousOwner owns every record when the API runs with no sign-in at all: a
-// local run (ALBITOR_LOCAL=1) and the package's own tests. A deployed function
-// always has sign-in, and never acts as this owner.
+// local run (ALBITOR_LOCAL=1) without the local issuer, and the package's own
+// tests. A deployed function always has sign-in, and never acts as this owner.
+// A local run with ALBITOR_LOCAL_AUTH=1 checks tokens from the starter's local
+// issuer instead (see authSourceFromEnv).
 const AnonymousOwner = "anonymous"
 
 // Identity is the verified person a request acts for.
