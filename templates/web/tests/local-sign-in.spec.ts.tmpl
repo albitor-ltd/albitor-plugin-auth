@@ -1,0 +1,45 @@
+import { expect, test } from "@playwright/test";
+import { authHeader, localIssuerRunning, localTokens } from "./helpers/local-auth";
+
+// Two users, signed in through the local issuer, are two different people to
+// the API: each has its own `sub`, and neither sees the other's records. It
+// runs only against a local stack with the issuer on
+// (ALBITOR_LOCAL_AUTH=1 npm run test:e2e) and skips everywhere else. It sends
+// no e-mail and never calls Cognito: in a local run the API's token check
+// trusts the starter's local issuer instead of the pool
+// (api/server/auth_cognito.go).
+test.beforeEach(async ({ request }) => {
+  test.skip(
+    !(await localIssuerRunning(request)),
+    "no local issuer: not a local run with ALBITOR_LOCAL_AUTH=1",
+  );
+});
+
+test("two local users are two subjects, each with their own records", async ({ request }) => {
+  const alice = await localTokens(request, "alice");
+  const bob = await localTokens(request, "bob");
+
+  const aliceMe = await request.get("/api/me", { headers: authHeader(alice) });
+  const bobMe = await request.get("/api/me", { headers: authHeader(bob) });
+  expect(aliceMe.status()).toBe(200);
+  expect(bobMe.status()).toBe(200);
+  const aliceSub = (await aliceMe.json()).sub as string;
+  const bobSub = (await bobMe.json()).sub as string;
+  expect(aliceSub).toBe(alice.sub);
+  expect(bobSub).toBe(bob.sub);
+  expect(aliceSub).not.toBe(bobSub);
+
+  const title = `alice-only-${test.info().testId}`;
+  const created = await request.post("/api/items", { headers: authHeader(alice), data: { title } });
+  expect(created.status()).toBe(201);
+
+  const bobsItems = await request.get("/api/items", { headers: authHeader(bob) });
+  expect(bobsItems.status()).toBe(200);
+  const titles = ((await bobsItems.json()).items as { title: string }[]).map((item) => item.title);
+  expect(titles).not.toContain(title);
+});
+
+test("the API refuses a request with no token", async ({ request }) => {
+  const res = await request.get("/api/items");
+  expect(res.status()).toBe(401);
+});

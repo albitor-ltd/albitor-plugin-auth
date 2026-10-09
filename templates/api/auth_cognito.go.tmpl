@@ -38,6 +38,27 @@ const (
 	lambdaNameEnv     = "AWS_LAMBDA_FUNCTION_NAME"
 )
 
+// The starter's local issuer (api/internal/localauth): an in-process stand-in
+// for the pool that a local run starts with ALBITOR_LOCAL=1 ALBITOR_LOCAL_AUTH=1,
+// so specs sign in as named test identities with no sign-up or e-mail. These
+// values are its contract, restated here so this file does not import it: its
+// issuer is http://localhost:<PORT>/api/_local/auth, its keys are under that at
+// /.well-known/jwks.json, and its tokens are for localIssuerClientID.
+const (
+	localModeEnv        = "ALBITOR_LOCAL"
+	localIssuerEnv      = "ALBITOR_LOCAL_AUTH"
+	localIssuerPath     = "/api/_local/auth"
+	localIssuerClientID = "local-test-client"
+)
+
+// localIssuerURL is the local issuer's URL on port, as the starter serves it.
+func localIssuerURL(port string) string {
+	if strings.TrimSpace(port) == "" {
+		port = "8080"
+	}
+	return "http://localhost:" + strings.TrimSpace(port) + localIssuerPath
+}
+
 // The session cookies. Both HttpOnly, Secure and SameSite=Strict: no script
 // reads them and no other site's form sends them.
 const (
@@ -79,6 +100,8 @@ func (c authConfig) endpoint() string {
 // parameter's creation recovers on its own.
 type authSource struct {
 	load func(ctx context.Context) (*cognitoAuth, error)
+	// local is set on the source that trusts the starter's local issuer.
+	local bool
 
 	mu   sync.Mutex
 	auth *cognitoAuth
@@ -103,9 +126,16 @@ func (s *authSource) get(ctx context.Context) (*cognitoAuth, error) {
 //   - AUTH_USER_POOL_ID and AUTH_CLIENT_ID set (with AWS_REGION): those.
 //   - a deployed function: the parameter /<function name>/auth/config, which
 //     infrastructure/aws/auth.tf writes and lets this function read.
-//   - neither (ALBITOR_LOCAL=1, or a unit test): nil, and the gate lets every
-//     request through as AnonymousOwner. A deployed function never gets here:
-//     the Lambda runtime sets AWS_LAMBDA_FUNCTION_NAME itself.
+//   - a local run with the local issuer (ALBITOR_LOCAL=1 and
+//     ALBITOR_LOCAL_AUTH=1, no pool named, not a deployed function): the local
+//     issuer alone, and the sign-in calls answer that they are not available.
+//   - none of these (ALBITOR_LOCAL=1, or a unit test): nil, and the gate lets
+//     every request through as AnonymousOwner. A deployed function never gets
+//     here: the Lambda runtime sets AWS_LAMBDA_FUNCTION_NAME itself.
+//
+// The local issuer is trusted only in the third case, and the first two are
+// decided before it: a named pool or a deployed function never trusts it,
+// whatever else is set. Its URL is plain-http localhost, which no pool's is.
 func authSourceFromEnv(getenv func(string) string) *authSource {
 	pool := strings.TrimSpace(getenv(AuthUserPoolIDEnv))
 	client := strings.TrimSpace(getenv(AuthClientIDEnv))
@@ -120,6 +150,10 @@ func authSourceFromEnv(getenv func(string) string) *authSource {
 	}
 	fn := strings.TrimSpace(getenv(lambdaNameEnv))
 	if fn == "" {
+		if strings.TrimSpace(getenv(localModeEnv)) == "1" && strings.TrimSpace(getenv(localIssuerEnv)) == "1" {
+			auth := newLocalIssuerAuth(localIssuerURL(getenv("PORT")))
+			return &authSource{load: func(context.Context) (*cognitoAuth, error) { return auth, nil }, local: true}
+		}
 		return nil
 	}
 	name := "/" + fn + "/auth/config"
@@ -144,11 +178,25 @@ func authSourceFromEnv(getenv func(string) string) *authSource {
 }
 
 // cognitoAuth is one pool and client: the token check and the public calls.
+// With local set it is the starter's local issuer instead: tokens are checked
+// the same way, and there is no pool to make the sign-in calls to.
 type cognitoAuth struct {
 	clientID string
 	endpoint string
 	client   *http.Client
 	verifier *tokenVerifier
+	local    bool
+}
+
+// newLocalIssuerAuth trusts the local issuer at issuer, and nothing else.
+func newLocalIssuerAuth(issuer string) *cognitoAuth {
+	client := &http.Client{Timeout: cognitoTimeout}
+	return &cognitoAuth{
+		clientID: localIssuerClientID,
+		client:   client,
+		verifier: newTokenVerifier(issuer, localIssuerClientID, issuer+"/.well-known/jwks.json", client),
+		local:    true,
+	}
 }
 
 func newCognitoAuth(cfg authConfig) *cognitoAuth {
@@ -214,7 +262,7 @@ func requestToken(r *http.Request) (string, bool) {
 // refreshSession swaps the refresh cookie for a new session.
 func (a *cognitoAuth) refreshSession(w http.ResponseWriter, r *http.Request) (Identity, error) {
 	c, err := r.Cookie(refreshCookie)
-	if err != nil || c.Value == "" {
+	if a.local || err != nil || c.Value == "" {
 		return Identity{}, errTokenInvalid
 	}
 	tokens, cerr := a.initiateAuth(r.Context(), "REFRESH_TOKEN_AUTH", map[string]string{"REFRESH_TOKEN": c.Value})
@@ -254,6 +302,14 @@ func clearSessionCookies(w http.ResponseWriter) {
 func (a *cognitoAuth) serveAuth(w http.ResponseWriter, r *http.Request, logger *slog.Logger) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if a.local {
+		// A local run has no pool to sign in to. A spec signs in through the
+		// local issuer instead (web/tests/helpers/local-auth.ts).
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "sign-in is not available in a local run: use the local issuer", "code": "local",
+		})
 		return
 	}
 	// JSON only. Another site's HTML form cannot send this content type
