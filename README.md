@@ -22,6 +22,7 @@ sign-in (`password`). Templates are plain files: the platform substitutes only i
 | `web/public/index.html`, `auth.js`, `auth.css` | Sign-in, sign-up, confirm-code and reset screens with stable `data-testid`s |
 | `web/serve.mjs` | The local static server, serving the shell for route paths as CloudFront does |
 | `web/tests/auth.setup.ts`, `web/tests/auth-screens.spec.ts` | `SIGN_IN_SCREEN_EXISTS = true`, and a signed-out spec of the screens |
+| `web/tests/helpers/mailbox.ts` | The walk mailbox helper the one sign-up spec uses to sign up as a real visitor and read its confirmation code during a platform journey walk; byte-identical to the Albitor starter's copy |
 | `scripts/seed-journey-fixtures.sh` | Journey fixtures seeded as the verifier and the demo account |
 
 Every pack version's rendered tree is gated at ingest by the platform's floor checks, so a build

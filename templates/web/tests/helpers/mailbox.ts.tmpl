@@ -1,0 +1,124 @@
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { test } from "@playwright/test";
+
+// The walk mailbox: how the ONE sign-up spec signs up as a real visitor.
+//
+// WHY THIS EXISTS. Every other spec signs in as the seeded account that
+// auth.setup.ts saves. The sign-up journey cannot: it has to prove that a new
+// visitor can register, receive the confirmation email, and confirm. When the
+// platform walks this app's sign-up journey it gives the walk a receive-only
+// email address of its own, reads the confirmation email for the spec, and
+// deletes the account afterwards. The spec never sees the email itself, only
+// the code to type (or the fact that the platform followed the email's
+// confirmation link on the spec's behalf).
+//
+// THE CONTRACT IS FILES, in a private directory named by
+// ALBITOR_JOURNEY_MAILBOX, and these names are restated in the platform's
+// runner (app/runner/walk_signup.go), which cannot be imported from here:
+//
+//   account.json             written by the platform: { address, password, reset_password }
+//   awaiting-<n>             written here, once the app has been asked to send email n
+//   verification-<n>.json    written by the platform: { code }, { followed } or { open }
+//
+// OUTSIDE A WALK THERE IS NO MAILBOX. walkMailboxAvailable() is false on an
+// ordinary local or CI run; the sign-up spec skips itself there:
+//
+//   test.skip(!walkMailboxAvailable(), "the sign-up journey is walked only with the platform's mailbox");
+//
+// THE ACCOUNT IS THE PLATFORM'S TO DELETE. Sign up with walkAccount()'s
+// address and password exactly. A password-reset step sets reset_password,
+// never a password of its own: the platform signs the account in with one of
+// the two to delete it, and an account it cannot sign in to is left behind.
+
+export type WalkAccount = {
+  address: string;
+  password: string;
+  resetPassword: string;
+};
+
+export type WalkVerification = {
+  // The code to type into the app's confirm screen, when the email carried one.
+  code?: string;
+  // Whether the platform followed the email's confirmation link, when it
+  // carried a link it could confirm with a request.
+  followed?: boolean;
+  // The confirmation link's path and query on this app, when the link opens a
+  // page: the spec opens it in the browser (page.goto(open)) so the app's
+  // own script can confirm the address.
+  open?: string;
+};
+
+const mailboxDir = process.env.ALBITOR_JOURNEY_MAILBOX || "";
+
+// How long to wait for one email before failing the step. The platform gives
+// up on an email after two minutes, so this waits a little longer than that.
+const VERIFICATION_TIMEOUT_MS = 150_000;
+const POLL_MS = 500;
+
+// walkMailboxAvailable reports whether this run has the platform's mailbox.
+export function walkMailboxAvailable(): boolean {
+  return mailboxDir !== "" && existsSync(join(mailboxDir, "account.json"));
+}
+
+// walkAccount is the address and passwords this walk signs up with.
+export function walkAccount(): WalkAccount {
+  if (!walkMailboxAvailable()) {
+    throw new Error("no walk mailbox: ALBITOR_JOURNEY_MAILBOX names no account file");
+  }
+  const parsed = JSON.parse(readFileSync(join(mailboxDir, "account.json"), "utf8")) as {
+    address?: string;
+    password?: string;
+    reset_password?: string;
+  };
+  if (!parsed.address || !parsed.password || !parsed.reset_password) {
+    throw new Error("the walk mailbox's account file is incomplete");
+  }
+  return { address: parsed.address, password: parsed.password, resetPassword: parsed.reset_password };
+}
+
+// awaitVerification asks the platform for the next email sent to the walk's
+// address and waits for what it found: a code to type, or that it followed the
+// confirmation link. Call it AFTER the step that makes the app send the email.
+// It throws when no usable email arrived, which fails the step that needed it.
+//
+// The email's number is read off the directory, not a counter in this process,
+// so a Playwright worker restarted after a failure keeps counting.
+export async function awaitVerification(): Promise<WalkVerification> {
+  if (!walkMailboxAvailable()) {
+    throw new Error("no walk mailbox: ALBITOR_JOURNEY_MAILBOX names no account file");
+  }
+  // The wait is longer than a test's default timeout, so the test's own
+  // timeout is extended by it.
+  try {
+    const current = test.info().timeout;
+    if (typeof current === "number" && current > 0) {
+      test.setTimeout(current + VERIFICATION_TIMEOUT_MS);
+    }
+  } catch {
+    // Not inside a running test: nothing to extend.
+  }
+  const n = readdirSync(mailboxDir).filter((name) => name.startsWith("awaiting-")).length + 1;
+  writeFileSync(join(mailboxDir, `awaiting-${n}`), "", { mode: 0o600 });
+  const answer = join(mailboxDir, `verification-${n}.json`);
+  const deadline = Date.now() + VERIFICATION_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (existsSync(answer)) {
+      const got = JSON.parse(readFileSync(answer, "utf8")) as WalkVerification;
+      if (got.code) {
+        return { code: got.code };
+      }
+      if (got.followed) {
+        return { followed: true };
+      }
+      // Only a path on this app's own origin: never one a browser would read
+      // as another host.
+      if (got.open?.startsWith("/") && !got.open.startsWith("//") && !got.open.startsWith("/\\")) {
+        return { open: got.open };
+      }
+      throw new Error(`email ${n}: no verification code or followable link reached the walk's mailbox`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+  throw new Error(`email ${n}: the walk's mailbox did not answer within ${VERIFICATION_TIMEOUT_MS / 1000}s`);
+}

@@ -31,6 +31,7 @@ extend it.
 | `web/public/index.html`, `auth.js`, `auth.css` | The screens at `/sign-in`, `/sign-up`, `/confirm` and `/reset`, cross-linked, with stable `data-testid`s. `auth.js` sends a signed-out visitor to `/sign-in` and back again. |
 | `web/serve.mjs` | Serves the shell for a route path, as CloudFront does, so `/sign-in` works in the pre-ship verify. |
 | `web/tests/auth.setup.ts`, `auth-screens.spec.ts` | `SIGN_IN_SCREEN_EXISTS = true`, and a signed-out spec that the screens render and link to each other. |
+| `web/tests/helpers/mailbox.ts` | The walk mailbox: `walkMailboxAvailable()`, `walkAccount()` and `awaitVerification()`, which the one sign-up spec uses to register as a real visitor and type the emailed code during the platform's journey walk. Kept byte-identical to the Albitor starter's copy, whose runner restates its file contract; change it only in step with that copy. |
 | `scripts/seed-journey-fixtures.sh` | Seeds the journey fixtures as the verifier and as the demo account, signing in through the app's own API. |
 
 The API makes the sign-in calls, not the browser, for three reasons: the page's CSP allows
@@ -65,7 +66,12 @@ this.** Build the same shape by hand, with this pack's `templates/` as the refer
 - **Never take the owner from the request body or a query parameter.**
 - **No Cognito Hosted UI.** The screens are the app's own.
 - **Only one spec registers.** A sign-up sends an email, and the default sender allows 50 a day
-  per AWS account. Other specs use the seeded session `auth.setup.ts` creates.
+  per AWS account. Other specs use the seeded session `auth.setup.ts` creates. That spec signs up
+  with `walkAccount()`'s address and password exactly, gets the code from `awaitVerification()`
+  and types it into `/confirm`, and skips itself when `walkMailboxAvailable()` is false.
+- **Keep confirmation by code.** The walk follows or opens only links on the app's own origin, so a
+  Cognito confirmation link cannot confirm the walk's account; keep `CONFIRM_WITH_CODE` in
+  `auth.tf`.
 
 ## Email: no real visitor can confirm until the account can send
 

@@ -1,7 +1,7 @@
 {
   "name": "auth",
   "displayName": "Auth pack (Cognito)",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "The default auth pack: end-user sign-up and sign-in for a delivered app, backed by an Amazon Cognito user pool. Ships templated files (pool and public client, the API's token check and GET /api/me, the sign-in, sign-up, confirm-code and reset screens) that the platform renders into a new BYOA app's first commit, and a skill for what each build still writes. Self-sign-up is on by default; email verification is required.",
   "author": {
     "name": "Albitor Ltd",
