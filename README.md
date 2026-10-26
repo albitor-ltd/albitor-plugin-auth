@@ -1,3 +1,5 @@
+> **Archived 2026-10-26.** Superseded by [albitor-ltd/albitor-plugins](https://github.com/albitor-ltd/albitor-plugins) (`plugins/auth`, tag `auth/v0.7.0`). Read-only.
+
 # Auth pack plugin (`auth`)
 
 A [Claude Code plugin](https://code.claude.com/docs/en/plugins) that packages the **default auth mechanism** for a delivered app: end-user **sign-up and login** backed by an Amazon Cognito user pool, with the UI rendered **in the app** and styled by whatever design-system skill the app chose.
